@@ -1,0 +1,2192 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Loondashboard</title>
+
+  <!-- React + Babel + Tailwind via CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- App dependencies -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+  <!-- Fonts -->
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <style>
+    body { font-family: 'Manrope', system-ui, sans-serif; margin: 0; }
+    input[type="number"] { -moz-appearance: textfield; }
+    input[type="number"]::-webkit-outer-spin-button,
+    input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .tabular-nums { font-variant-numeric: tabular-nums; }
+    #loading { display: flex; align-items: center; justify-content: center; min-height: 100vh; color: #78716c; font-family: system-ui, sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="root"><div id="loading">Bezig met laden…</div></div>
+
+  <script>
+    // ----- localStorage shim that mimics Claude's window.storage API -----
+    window.storage = {
+      async get(key) {
+        const v = localStorage.getItem(key);
+        if (v === null) return null;
+        return { key, value: v, shared: false };
+      },
+      async set(key, value) {
+        localStorage.setItem(key, value);
+        return { key, value, shared: false };
+      },
+      async delete(key) {
+        const existed = localStorage.getItem(key) !== null;
+        localStorage.removeItem(key);
+        return { key, deleted: existed, shared: false };
+      },
+      async list(prefix = '') {
+        const keys = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith(prefix)) keys.push(k);
+        }
+        return { keys, prefix, shared: false };
+      }
+    };
+
+    // Export / import all data
+    window.exportPayrollData = function () {
+      const data = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && (k === 'setup' || k.startsWith('month:'))) data[k] = localStorage.getItem(k);
+      }
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const date = new Date().toISOString().slice(0, 10);
+      a.download = `loondashboard-backup-${date}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+
+    window.importPayrollData = function (file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const data = JSON.parse(reader.result);
+            for (const [k, v] of Object.entries(data)) localStorage.setItem(k, v);
+            resolve(Object.keys(data).length);
+          } catch (e) { reject(e); }
+        };
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(file);
+      });
+    };
+  </script>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useMemo } = React;
+    const Papa = window.Papa;
+
+    // ----- Lucide icon components (inline SVG) -----
+    const makeIcon = (paths) => ({ size = 16, className = '', ...rest }) =>
+      React.createElement('svg', {
+        xmlns: 'http://www.w3.org/2000/svg', width: size, height: size, viewBox: '0 0 24 24',
+        fill: 'none', stroke: 'currentColor', strokeWidth: 2,
+        strokeLinecap: 'round', strokeLinejoin: 'round', className, ...rest
+      }, paths.map((p, i) => React.createElement(p.t, { key: i, ...p.a })));
+
+    const P = (d) => ({ t: 'path', a: { d } });
+    const L = (x1, y1, x2, y2) => ({ t: 'line', a: { x1, y1, x2, y2 } });
+    const C = (cx, cy, r) => ({ t: 'circle', a: { cx, cy, r } });
+    const R = (x, y, w, h, rx) => ({ t: 'rect', a: { x, y, width: w, height: h, rx } });
+    const PL = (points) => ({ t: 'polyline', a: { points } });
+
+    const Plus = makeIcon([P('M5 12h14'), P('M12 5v14')]);
+    const Trash2 = makeIcon([P('M3 6h18'), P('M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6'), P('M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2'), L(10, 11, 10, 17), L(14, 11, 14, 17)]);
+    const Upload = makeIcon([P('M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'), PL('17 8 12 3 7 8'), L(12, 3, 12, 15)]);
+    const Download = makeIcon([P('M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'), PL('7 10 12 15 17 10'), L(12, 15, 12, 3)]);
+    const FileText = makeIcon([P('M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z'), PL('14 2 14 8 20 8'), L(16, 13, 8, 13), L(16, 17, 8, 17), L(10, 9, 8, 9)]);
+    const Settings = makeIcon([P('M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z'), C(12, 12, 3)]);
+    const Calendar = makeIcon([R(3, 4, 18, 18, 2), L(16, 2, 16, 6), L(8, 2, 8, 6), L(3, 10, 21, 10)]);
+    const Users = makeIcon([P('M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2'), C(9, 7, 4), P('M22 21v-2a4 4 0 0 0-3-3.87'), P('M16 3.13a4 4 0 0 1 0 7.75')]);
+    const Briefcase = makeIcon([R(2, 7, 20, 14, 2), P('M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16')]);
+    const X = makeIcon([P('M18 6 6 18'), P('m6 6 12 12')]);
+    const Building2 = makeIcon([P('M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18Z'), P('M6 12H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2'), P('M18 9h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2'), P('M10 6h4'), P('M10 10h4'), P('M10 14h4'), P('M10 18h4')]);
+    const ImageIcon = makeIcon([R(3, 3, 18, 18, 2), C(9, 9, 2), P('m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21')]);
+    const AlertCircle = makeIcon([C(12, 12, 10), L(12, 8, 12, 12), L(12, 16, 12.01, 16)]);
+    const CheckCircle2 = makeIcon([P('M21.801 10A10 10 0 1 1 17 3.335'), P('m9 11 3 3L22 4')]);
+    const Sparkles = makeIcon([P('M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .962 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.962 0z'), P('M20 3v4'), P('M22 5h-4'), P('M4 17v2'), P('M5 18H3')]);
+    const ChevronDown = makeIcon([P('m6 9 6 6 6-6')]);
+    const ChevronUp = makeIcon([P('m18 15-6-6-6 6')]);
+    const Clock = makeIcon([C(12, 12, 10), PL('12 6 12 12 16 14')]);
+    const Search = makeIcon([C(11, 11, 8), L(21, 21, 16.65, 16.65)]);
+    const Database = makeIcon([({ t: 'ellipse', a: { cx: 12, cy: 5, rx: 9, ry: 3 } }), P('M3 5v14a9 3 0 0 0 18 0V5'), P('M3 12a9 3 0 0 0 18 0')]);
+
+    /* === APP CODE BELOW (auto-generated from React source) === */
+
+
+    /* ------------------------- Helpers ------------------------- */
+
+    const MONTHS_NL = [
+      "januari", "februari", "maart", "april", "mei", "juni",
+      "juli", "augustus", "september", "oktober", "november", "december"
+    ];
+
+    function parseTime(str) {
+      if (str === undefined || str === null) return 0;
+      const s = String(str).trim();
+      if (!s) return 0;
+      const parts = s.split(":").map(p => parseInt(p, 10) || 0);
+      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+      if (parts.length === 2) return parts[0] * 3600 + parts[1] * 60; // HH:MM
+      if (parts.length === 1) {
+        const f = parseFloat(s.replace(',', '.'));
+        if (!isNaN(f)) return Math.round(f * 3600);
+      }
+      return 0;
+    }
+
+    function formatSecs(secs) {
+      if (!secs || secs <= 0) return '';
+      const total = Math.round(secs);
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (s === 0) return `${h}:${String(m).padStart(2, '0')}`;
+      return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+
+    function secsToHours(secs) { return (secs || 0) / 3600; }
+
+    function fmtHours(h) {
+      return (h || 0).toFixed(2).replace('.', ',');
+    }
+
+    function fmtEuro(n) {
+      const v = n || 0;
+      return '€ ' + v.toFixed(2).replace('.', ',');
+    }
+
+    function fmtMonth(ym) {
+      if (!ym) return '';
+      const [y, m] = ym.split('-');
+      return `${MONTHS_NL[parseInt(m, 10) - 1]} ${y}`;
+    }
+
+    function calcBonus(sales, tiers) {
+      if (!sales || !tiers || tiers.length === 0) return 0;
+      const applicable = tiers
+        .filter(t => sales >= (Number(t.minSales) || 0))
+        .sort((a, b) => (Number(b.minSales) || 0) - (Number(a.minSales) || 0));
+      if (applicable.length === 0) return 0;
+      const t = applicable[0];
+      const min = Number(t.minSales) || 0;
+      const max = Number(t.maxSales) || sales;
+      const base = Number(t.base) || 0;
+      const perSale = Number(t.perSale) || 0;
+      const cappedSales = Math.min(sales, max);
+      return base + Math.max(0, cappedSales - min) * perSale;
+    }
+
+    function calcHourBonus(qualifyingHours, tiers) {
+      if (!qualifyingHours || !tiers || tiers.length === 0) return { amount: 0, tier: null };
+      const applicable = tiers
+        .filter(t => qualifyingHours >= (Number(t.minHours) || 0))
+        .sort((a, b) => (Number(b.minHours) || 0) - (Number(a.minHours) || 0));
+      if (applicable.length === 0) return { amount: 0, tier: null };
+      const t = applicable[0];
+      return { amount: Number(t.amount) || 0, tier: t };
+    }
+
+    function genId() {
+      return Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
+    }
+
+    const COL_KEYWORDS = {
+      name: ['naam', 'agent', 'medewerker', 'employee', 'name'],
+      project: ['project', 'campagne', 'campaign'],
+      sales: ['sales', 'verkopen', 'aantal sales', 'verkoop'],
+      begeleiding: ['begeleid'],
+      nawerktijd: ['nawerk', 'after call', 'wrap'],
+      inGesprek: ['gesprek', 'in call', 'talk'],
+      uitbellend: ['uitbel', 'outbound', 'dial'],
+      beschikbaar: ['beschikbaar', 'available', 'ready', 'idle']
+    };
+
+    function detectColumns(headers) {
+      const result = {};
+      for (const [key, keywords] of Object.entries(COL_KEYWORDS)) {
+        const found = headers.find(h => {
+          const lower = String(h).toLowerCase();
+          return keywords.some(k => lower.includes(k));
+        });
+        if (found) result[key] = found;
+      }
+      return result;
+    }
+
+    const TIME_FIELDS = [
+      ['begeleiding', 'Begeleiding'],
+      ['nawerktijd', 'Nawerktijd'],
+      ['inGesprek', 'In gesprek'],
+      ['uitbellend', 'Uitbellend'],
+      ['beschikbaar', 'Beschikbaar']
+    ];
+
+    function entryTotalSecs(e) {
+      return (e.begeleiding || 0) + (e.nawerktijd || 0) + (e.inGesprek || 0) + (e.uitbellend || 0) + (e.beschikbaar || 0);
+    }
+
+    // Returns lowercased keys an agent matches on: nickname + full name
+    function agentMatchKeys(agent) {
+      const keys = [];
+      const nick = (agent.nickname || '').trim().toLowerCase();
+      const name = (agent.name || '').trim().toLowerCase();
+      if (nick) keys.push(nick);
+      if (name && name !== nick) keys.push(name);
+      return keys;
+    }
+
+    /* ------------------------- Main App ------------------------- */
+
+    function PayrollDashboard() {
+      const [activeTab, setActiveTab] = useState('setup');
+      const [loading, setLoading] = useState(true);
+      const [notification, setNotification] = useState(null);
+
+      const [company, setCompany] = useState({ name: '', logo: null });
+      const [agents, setAgents] = useState([]);
+      const [projects, setProjects] = useState([]);
+      const [hourBonusTiers, setHourBonusTiers] = useState([
+        { id: 'default-tier-1', minHours: 125, amount: 50 },
+        { id: 'default-tier-2', minHours: 150, amount: 100 }
+      ]);
+      const [toiletAllowanceHours, setToiletAllowanceHours] = useState(3);
+
+      const today = new Date();
+      const defaultMonth = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+      const [currentMonth, setCurrentMonth] = useState(defaultMonth);
+      const [timeEntries, setTimeEntries] = useState([]);
+      const [holidays, setHolidays] = useState([]);
+      const [agentMonthData, setAgentMonthData] = useState({});
+
+      const [jsPdfLoaded, setJsPdfLoaded] = useState(false);
+      const [generating, setGenerating] = useState(false);
+
+      /* Load fonts and jsPDF */
+      useEffect(() => {
+        if (!document.getElementById('payroll-fonts')) {
+          const link = document.createElement('link');
+          link.id = 'payroll-fonts';
+          link.href = 'https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@300;400;500;600;700;800&display=swap';
+          link.rel = 'stylesheet';
+          document.head.appendChild(link);
+        }
+        if (window.jspdf) {
+          setJsPdfLoaded(true);
+        } else if (!document.getElementById('jspdf-script')) {
+          const script = document.createElement('script');
+          script.id = 'jspdf-script';
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
+          script.onload = () => setJsPdfLoaded(true);
+          document.body.appendChild(script);
+        }
+        if (!window.XLSX && !document.getElementById('xlsx-script')) {
+          const script = document.createElement('script');
+          script.id = 'xlsx-script';
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+          document.body.appendChild(script);
+        }
+        if (!window.JSZip && !document.getElementById('jszip-script')) {
+          const script = document.createElement('script');
+          script.id = 'jszip-script';
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+          document.body.appendChild(script);
+        }
+      }, []);
+
+      /* Load setup */
+      useEffect(() => {
+        (async () => {
+          try {
+            const r = await window.storage.get('setup');
+            if (r) {
+              const data = JSON.parse(r.value);
+              if (data.company) setCompany(data.company);
+              if (data.agents) setAgents(data.agents);
+              if (data.projects) setProjects(data.projects);
+              if (Array.isArray(data.hourBonusTiers)) setHourBonusTiers(data.hourBonusTiers);
+              if (typeof data.toiletAllowanceHours === 'number') setToiletAllowanceHours(data.toiletAllowanceHours);
+            }
+          } catch (e) { /* first run */ }
+          setLoading(false);
+        })();
+      }, []);
+
+      /* Load month when currentMonth changes (with migration from old format) */
+      useEffect(() => {
+        if (loading) return;
+        (async () => {
+          try {
+            const r = await window.storage.get(`month:${currentMonth}`);
+            if (r) {
+              const parsed = JSON.parse(r.value);
+              if (Array.isArray(parsed.timeEntries)) {
+                setTimeEntries(parsed.timeEntries);
+              } else if (parsed.timeData && typeof parsed.timeData === 'object') {
+                // migrate: one entry per agent, no project name
+                const migrated = Object.entries(parsed.timeData).map(([key, td]) => ({
+                  id: genId(),
+                  agentKey: key,
+                  agentDisplayName: td.displayName || key,
+                  projectName: '',
+                  begeleiding: td.begeleiding || 0,
+                  nawerktijd: td.nawerktijd || 0,
+                  inGesprek: td.inGesprek || 0,
+                  uitbellend: td.uitbellend || 0,
+                  beschikbaar: td.beschikbaar || 0
+                }));
+                setTimeEntries(migrated);
+              } else {
+                setTimeEntries([]);
+              }
+              setHolidays(parsed.holidays || []);
+              setAgentMonthData(parsed.agentMonthData || {});
+            } else {
+              setTimeEntries([]); setHolidays([]); setAgentMonthData({});
+            }
+          } catch (e) {
+            setTimeEntries([]); setHolidays([]); setAgentMonthData({});
+          }
+        })();
+      }, [currentMonth, loading]);
+
+      /* Save setup (debounced) */
+      useEffect(() => {
+        if (loading) return;
+        const t = setTimeout(async () => {
+          try {
+            await window.storage.set('setup', JSON.stringify({ company, agents, projects, hourBonusTiers, toiletAllowanceHours }));
+          } catch (e) { console.error(e); }
+        }, 400);
+        return () => clearTimeout(t);
+      }, [company, agents, projects, hourBonusTiers, toiletAllowanceHours, loading]);
+
+      /* Save month (debounced) */
+      useEffect(() => {
+        if (loading) return;
+        const t = setTimeout(async () => {
+          try {
+            await window.storage.set(`month:${currentMonth}`, JSON.stringify({ timeEntries, holidays, agentMonthData }));
+          } catch (e) { console.error(e); }
+        }, 400);
+        return () => clearTimeout(t);
+      }, [timeEntries, holidays, agentMonthData, currentMonth, loading]);
+
+      function notify(msg, kind = 'success') {
+        setNotification({ msg, kind });
+        setTimeout(() => setNotification(null), 3000);
+      }
+
+      /* ---------- Setup handlers ---------- */
+      function handleLogoUpload(e) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        if (file.size > 1024 * 1024) { notify('Logo te groot (max 1MB)', 'error'); return; }
+        const reader = new FileReader();
+        reader.onload = () => setCompany(c => ({ ...c, logo: reader.result }));
+        reader.readAsDataURL(file);
+      }
+      function addAgent() { setAgents(a => [...a, { id: genId(), name: '', nickname: '', hourlyWage: 0, bankAccount: '', swiftCode: '', accountCurrency: 'EUR', payoutMethod: 'rekening', fixedAllowances: [] }]); }
+      function updateAgent(id, field, value) { setAgents(a => a.map(x => x.id === id ? { ...x, [field]: value } : x)); }
+      function removeAgent(id) {
+        if (!confirm('Medewerker verwijderen?')) return;
+        setAgents(a => a.filter(x => x.id !== id));
+      }
+      function addFixedAllowance(agentId) {
+        setAgents(a => a.map(x => x.id === agentId
+          ? { ...x, fixedAllowances: [...(x.fixedAllowances || []), { id: genId(), description: '', amount: 0 }] }
+          : x));
+      }
+      function updateFixedAllowance(agentId, allowanceId, field, value) {
+        setAgents(a => a.map(x => x.id === agentId
+          ? { ...x, fixedAllowances: (x.fixedAllowances || []).map(al => al.id === allowanceId ? { ...al, [field]: value } : al) }
+          : x));
+      }
+      function removeFixedAllowance(agentId, allowanceId) {
+        setAgents(a => a.map(x => x.id === agentId
+          ? { ...x, fixedAllowances: (x.fixedAllowances || []).filter(al => al.id !== allowanceId) }
+          : x));
+      }
+      function addProject() { setProjects(p => [...p, { id: genId(), name: '', tiers: [] }]); }
+      function updateProject(id, field, value) { setProjects(p => p.map(x => x.id === id ? { ...x, [field]: value } : x)); }
+      function removeProject(id) {
+        if (!confirm('Project verwijderen? Sales op dit project gaan verloren.')) return;
+        setProjects(p => p.filter(x => x.id !== id));
+      }
+      function addTier(projectId) {
+        setProjects(p => p.map(x => x.id === projectId ? {
+          ...x, tiers: [...x.tiers, { id: genId(), minSales: 50, maxSales: 75, base: 25, perSale: 0.25 }]
+        } : x));
+      }
+      function updateTier(projectId, tierId, field, value) {
+        setProjects(p => p.map(x => x.id === projectId ? {
+          ...x, tiers: x.tiers.map(t => t.id === tierId ? { ...t, [field]: value } : t)
+        } : x));
+      }
+      function removeTier(projectId, tierId) {
+        setProjects(p => p.map(x => x.id === projectId ? {
+          ...x, tiers: x.tiers.filter(t => t.id !== tierId)
+        } : x));
+      }
+
+      /* ---------- Hour bonus tiers ---------- */
+      function addHourBonusTier() {
+        setHourBonusTiers(t => [...t, { id: genId(), minHours: 0, amount: 0 }]);
+      }
+      function updateHourBonusTier(id, field, value) {
+        setHourBonusTiers(t => t.map(x => x.id === id ? { ...x, [field]: value } : x));
+      }
+      function removeHourBonusTier(id) {
+        setHourBonusTiers(t => t.filter(x => x.id !== id));
+      }
+
+      /* ---------- CSV upload ---------- */
+      function handleCsvUpload(e) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const replace = timeEntries.length === 0 || confirm('Bestaande uren-regels vervangen met de nieuwe CSV?\n(Annuleren = toevoegen aan bestaande regels)');
+        Papa.parse(file, {
+          header: true,
+          skipEmptyLines: true,
+          complete: (res) => {
+            const headers = res.meta.fields || [];
+            const cols = detectColumns(headers);
+            if (!cols.name) {
+              notify('Kolom met naam niet gevonden in CSV', 'error');
+              return;
+            }
+            const newEntries = [];
+            for (const row of res.data) {
+              const name = String(row[cols.name] || '').trim();
+              if (!name) continue;
+              const projectName = cols.project ? String(row[cols.project] || '').trim() : '';
+              newEntries.push({
+                id: genId(),
+                agentKey: name.toLowerCase(),
+                agentDisplayName: name,
+                projectName,
+                sales: cols.sales ? (parseFloat(String(row[cols.sales]).replace(',', '.')) || 0) : 0,
+                begeleiding: cols.begeleiding ? parseTime(row[cols.begeleiding]) : 0,
+                nawerktijd: cols.nawerktijd ? parseTime(row[cols.nawerktijd]) : 0,
+                inGesprek: cols.inGesprek ? parseTime(row[cols.inGesprek]) : 0,
+                uitbellend: cols.uitbellend ? parseTime(row[cols.uitbellend]) : 0,
+                beschikbaar: cols.beschikbaar ? parseTime(row[cols.beschikbaar]) : 0
+              });
+            }
+            setTimeEntries(prev => replace ? newEntries : [...prev, ...newEntries]);
+            // Calculate match counts
+            const knownKeys = new Set();
+            agents.forEach(ag => agentMatchKeys(ag).forEach(k => knownKeys.add(k)));
+            const uniqueCsvKeys = new Set(newEntries.map(e => e.agentKey));
+            const matched = Array.from(uniqueCsvKeys).filter(k => knownKeys.has(k)).length;
+            const unmatched = uniqueCsvKeys.size - matched;
+            const bits = [];
+            if (!cols.project) bits.push('geen projectkolom');
+            if (!cols.sales) bits.push('geen sales-kolom');
+            const projectMsg = bits.length ? ` (${bits.join(', ')})` : '';
+            notify(`${newEntries.length} regel(s), ${uniqueCsvKeys.size} agents · ${matched} gematcht, ${unmatched} onbekend${projectMsg}`);
+          },
+          error: (err) => notify('CSV-fout: ' + err.message, 'error')
+        });
+        e.target.value = '';
+      }
+
+      function clearTimeEntries() {
+        if (!confirm('Alle uren-regels van deze maand verwijderen?')) return;
+        setTimeEntries([]);
+      }
+
+      /* ---------- Time entry handlers ---------- */
+      function addTimeEntry(entry) {
+        setTimeEntries(es => [...es, { id: genId(), ...entry }]);
+      }
+      function updateTimeEntry(id, field, value) {
+        setTimeEntries(es => es.map(e => e.id === id ? { ...e, [field]: value } : e));
+      }
+      function removeTimeEntry(id) {
+        setTimeEntries(es => es.filter(e => e.id !== id));
+      }
+
+      /* ---------- Holidays ---------- */
+      function addHoliday() { setHolidays(h => [...h, { id: genId(), date: '', name: '', hoursPerAgent: 8 }]); }
+      function updateHoliday(id, field, value) { setHolidays(h => h.map(x => x.id === id ? { ...x, [field]: value } : x)); }
+      function removeHoliday(id) { setHolidays(h => h.filter(x => x.id !== id)); }
+
+      /* ---------- Agent month data ---------- */
+      function getAgentMD(agentId) {
+        return agentMonthData[agentId] || { incentiveHours: 0, sales: {}, manualBonuses: [], systemOutages: [] };
+      }
+      function updateAgentMD(agentId, fn) {
+        setAgentMonthData(d => ({ ...d, [agentId]: fn(getAgentMD(agentId)) }));
+      }
+      function setIncentiveHours(agentId, hours) { updateAgentMD(agentId, md => ({ ...md, incentiveHours: hours })); }
+      function setSales(agentId, projectId, count) {
+        updateAgentMD(agentId, md => {
+          const newSales = { ...md.sales };
+          if (count === null || count === undefined || count === '') delete newSales[projectId];
+          else newSales[projectId] = count;
+          return { ...md, sales: newSales };
+        });
+      }
+      function addSystemOutage(agentId) {
+        updateAgentMD(agentId, md => ({
+          ...md,
+          systemOutages: [...(md.systemOutages || []), { id: genId(), description: '', hours: 0 }]
+        }));
+      }
+      function updateSystemOutage(agentId, outageId, field, value) {
+        updateAgentMD(agentId, md => ({
+          ...md,
+          systemOutages: (md.systemOutages || []).map(o => o.id === outageId ? { ...o, [field]: value } : o)
+        }));
+      }
+      function removeSystemOutage(agentId, outageId) {
+        updateAgentMD(agentId, md => ({
+          ...md,
+          systemOutages: (md.systemOutages || []).filter(o => o.id !== outageId)
+        }));
+      }
+      function addManualBonus(agentId) {
+        updateAgentMD(agentId, md => ({
+          ...md,
+          manualBonuses: [...(md.manualBonuses || []), { id: genId(), description: '', amount: 0 }]
+        }));
+      }
+      function updateManualBonus(agentId, bonusId, field, value) {
+        updateAgentMD(agentId, md => ({
+          ...md,
+          manualBonuses: (md.manualBonuses || []).map(b => b.id === bonusId ? { ...b, [field]: value } : b)
+        }));
+      }
+      function removeManualBonus(agentId, bonusId) {
+        updateAgentMD(agentId, md => ({
+          ...md,
+          manualBonuses: (md.manualBonuses || []).filter(b => b.id !== bonusId)
+        }));
+      }
+
+      /* ---------- Compute payroll for agent ---------- */
+      function computeAgentPayroll(agent) {
+        const keys = agentMatchKeys(agent);
+        const keySet = new Set(keys);
+        const entries = timeEntries.filter(e => keySet.has(e.agentKey));
+
+        // Per-project group
+        const groupMap = {};
+        let totalSecs = 0;
+        for (const e of entries) {
+          const projName = e.projectName?.trim() || 'Geen project';
+          if (!groupMap[projName]) {
+            groupMap[projName] = {
+              projectName: projName,
+              begeleiding: 0, nawerktijd: 0, inGesprek: 0, uitbellend: 0, beschikbaar: 0, totalSecs: 0,
+              sales: 0
+            };
+          }
+          const g = groupMap[projName];
+          g.begeleiding += e.begeleiding || 0;
+          g.nawerktijd += e.nawerktijd || 0;
+          g.inGesprek += e.inGesprek || 0;
+          g.uitbellend += e.uitbellend || 0;
+          g.beschikbaar += e.beschikbaar || 0;
+          g.sales += Number(e.sales) || 0;
+          const s = entryTotalSecs(e);
+          g.totalSecs += s;
+          totalSecs += s;
+        }
+        const projectGroups = Object.values(groupMap);
+
+        const workHours = secsToHours(totalSecs);
+        const wage = Number(agent.hourlyWage) || 0;
+        const workPay = workHours * wage;
+
+        const totalHolidayHours = holidays.reduce((s, h) => s + (Number(h.hoursPerAgent) || 0), 0);
+        const holidayPay = totalHolidayHours * wage;
+
+        const md = getAgentMD(agent.id);
+        const incHours = Number(md.incentiveHours) || 0;
+        const incentivePay = incHours * wage;
+
+        // Combine sales: sum from time entries + manual override (md.sales overrides if set)
+        const projectBonuses = projects.map(p => {
+          // Match project-name-from-CSV to configured project (case insensitive)
+          const matchingGroup = projectGroups.find(g =>
+            g.projectName.trim().toLowerCase() === (p.name || '').trim().toLowerCase()
+          );
+          const csvSales = matchingGroup ? matchingGroup.sales : 0;
+          const manualSales = md.sales?.[p.id];
+          const sales = (manualSales !== undefined && manualSales !== null && manualSales !== '')
+            ? Number(manualSales) || 0
+            : csvSales;
+          return {
+            projectId: p.id,
+            projectName: p.name,
+            sales,
+            fromCsv: manualSales === undefined || manualSales === null || manualSales === '',
+            bonus: calcBonus(sales, p.tiers)
+          };
+        }).filter(pb => pb.sales > 0 || pb.bonus > 0);
+
+        const totalProjectBonus = projectBonuses.reduce((s, b) => s + b.bonus, 0);
+        const totalManualBonus = (md.manualBonuses || []).reduce((s, b) => s + (Number(b.amount) || 0), 0);
+
+        // System outages
+        const systemOutages = md.systemOutages || [];
+        const outageHours = systemOutages.reduce((s, o) => s + (Number(o.hours) || 0), 0);
+        const outagePay = outageHours * wage;
+
+        // Toilet allowance — every agent gets it automatically
+        const toiletHours = Number(toiletAllowanceHours) || 0;
+        const toiletPay = toiletHours * wage;
+
+        // Hour bonus — work + incentive + outage hours count
+        const qualifyingHours = workHours + incHours + outageHours;
+        const hourBonusResult = calcHourBonus(qualifyingHours, hourBonusTiers);
+        const hourBonusAmount = hourBonusResult.amount;
+
+        // Fixed monthly allowances per agent (responsibility, phone credit, etc.)
+        const fixedAllowances = agent.fixedAllowances || [];
+        const totalFixedAllowances = fixedAllowances.reduce((s, a) => s + (Number(a.amount) || 0), 0);
+
+        const totalGross = workPay + holidayPay + incentivePay + outagePay + toiletPay
+          + totalProjectBonus + totalManualBonus + hourBonusAmount + totalFixedAllowances;
+
+        return {
+          workHours, workPay, wage,
+          projectGroups,
+          totalHolidayHours, holidayPay,
+          incentiveHours: incHours, incentivePay,
+          systemOutages, outageHours, outagePay,
+          toiletHours, toiletPay,
+          qualifyingHours, hourBonus: hourBonusAmount, hourBonusTier: hourBonusResult.tier,
+          projectBonuses, totalProjectBonus,
+          manualBonuses: md.manualBonuses || [],
+          totalManualBonus,
+          fixedAllowances, totalFixedAllowances,
+          totalGross
+        };
+      }
+
+      /* ---------- PDF generation ---------- */
+      function buildPdfDoc(agent) {
+        if (!window.jspdf) { notify('PDF library nog aan het laden...', 'error'); return null; }
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+        const c = computeAgentPayroll(agent);
+        const monthLabel = fmtMonth(currentMonth);
+
+        const PAGE_W = 210, PAGE_H = 297, MARGIN = 18;
+        const ACCENT = [31, 61, 46], INK = [20, 20, 20], MUTED = [120, 120, 120];
+
+        doc.setFillColor(...ACCENT); doc.rect(0, 0, PAGE_W, 6, 'F');
+
+        let logoBottom = MARGIN;
+        if (company.logo) {
+          try { doc.addImage(company.logo, MARGIN, MARGIN, 24, 24, undefined, 'FAST'); logoBottom = MARGIN + 24; }
+          catch (e) { /* ignore */ }
+        }
+
+        doc.setTextColor(...INK);
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(18);
+        doc.text(company.name || 'Bedrijf', PAGE_W - MARGIN, MARGIN + 6, { align: 'right' });
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.setTextColor(...MUTED);
+        doc.text('LOONSTROOK', PAGE_W - MARGIN, MARGIN + 12, { align: 'right' });
+        doc.setFont('helvetica', 'bold'); doc.setTextColor(...INK);
+        doc.text(monthLabel, PAGE_W - MARGIN, MARGIN + 18, { align: 'right' });
+
+        let y = Math.max(logoBottom, MARGIN + 24) + 10;
+
+        doc.setDrawColor(220, 220, 215); doc.setLineWidth(0.3);
+        doc.line(MARGIN, y, PAGE_W - MARGIN, y); y += 8;
+
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...MUTED);
+        doc.text('MEDEWERKER', MARGIN, y);
+        doc.text('UURLOON', PAGE_W - MARGIN, y, { align: 'right' });
+        y += 5;
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(13); doc.setTextColor(...INK);
+        doc.text(agent.name, MARGIN, y);
+        doc.text(fmtEuro(c.wage), PAGE_W - MARGIN, y, { align: 'right' });
+        y += 12;
+
+        function ensureSpace(needed) {
+          if (y + needed > PAGE_H - 35) { doc.addPage(); y = MARGIN; }
+        }
+        function sectionHeader(label) {
+          ensureSpace(12);
+          doc.setFont('helvetica', 'bold'); doc.setFontSize(10); doc.setTextColor(...ACCENT);
+          doc.text(label.toUpperCase(), MARGIN, y); y += 1.5;
+          doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
+          doc.line(MARGIN, y, PAGE_W - MARGIN, y); y += 5;
+        }
+        function row(label, qty, rate, amount, bold = false, indent = 0) {
+          ensureSpace(7);
+          doc.setFont('helvetica', bold ? 'bold' : 'normal'); doc.setFontSize(10); doc.setTextColor(...INK);
+          doc.text(label, MARGIN + indent, y);
+          if (qty) { doc.setTextColor(...MUTED); doc.text(qty, MARGIN + 100, y, { align: 'right' }); }
+          if (rate) { doc.setTextColor(...MUTED); doc.text(rate, MARGIN + 135, y, { align: 'right' }); }
+          doc.setTextColor(...INK); doc.text(amount, PAGE_W - MARGIN, y, { align: 'right' });
+          y += 6;
+        }
+
+        // Werkuren per project
+        sectionHeader('Werkuren');
+        if (c.projectGroups.length === 0) {
+          row('Geen uren geregistreerd', '', '', fmtEuro(0));
+        } else {
+          c.projectGroups.forEach(g => {
+            const gHours = secsToHours(g.totalSecs);
+            const gPay = gHours * c.wage;
+            row(g.projectName, fmtHours(gHours) + ' uur', fmtEuro(c.wage), fmtEuro(gPay));
+            // sub-rows
+            doc.setFontSize(9); doc.setTextColor(...MUTED);
+            TIME_FIELDS.forEach(([k, label]) => {
+              if (g[k] > 0) {
+                ensureSpace(5);
+                doc.text(`· ${label}: ${fmtHours(secsToHours(g[k]))} uur`, MARGIN + 4, y);
+                y += 4.5;
+              }
+            });
+            y += 1;
+          });
+          doc.setDrawColor(230, 230, 225); doc.setLineWidth(0.2);
+          doc.line(MARGIN, y - 2, PAGE_W - MARGIN, y - 2);
+          row('Totaal werkuren', fmtHours(c.workHours) + ' uur', '', fmtEuro(c.workPay), true);
+        }
+        y += 3;
+
+        if (holidays.length > 0) {
+          sectionHeader('Feestdagen');
+          holidays.forEach(h => {
+            const hours = Number(h.hoursPerAgent) || 0;
+            row(h.name || h.date || 'Feestdag', fmtHours(hours) + ' uur', fmtEuro(c.wage), fmtEuro(hours * c.wage));
+          });
+          doc.setDrawColor(230, 230, 225);
+          doc.line(MARGIN, y - 2, PAGE_W - MARGIN, y - 2);
+          row('Totaal feestdagen', fmtHours(c.totalHolidayHours) + ' uur', '', fmtEuro(c.holidayPay), true);
+          y += 3;
+        }
+
+        if (c.incentiveHours > 0) {
+          sectionHeader('Incentive uren');
+          row('Incentive uren', fmtHours(c.incentiveHours) + ' uur', fmtEuro(c.wage), fmtEuro(c.incentivePay));
+          y += 3;
+        }
+
+        if (c.systemOutages.length > 0) {
+          sectionHeader('Systeemstoringen');
+          c.systemOutages.forEach(o => {
+            const hrs = Number(o.hours) || 0;
+            row(o.description || 'Systeemstoring', fmtHours(hrs) + ' uur', fmtEuro(c.wage), fmtEuro(hrs * c.wage));
+          });
+          doc.setDrawColor(230, 230, 225);
+          doc.line(MARGIN, y - 2, PAGE_W - MARGIN, y - 2);
+          row('Totaal systeemstoringen', fmtHours(c.outageHours) + ' uur', '', fmtEuro(c.outagePay), true);
+          y += 3;
+        }
+
+        if (c.toiletHours > 0) {
+          sectionHeader('Toiletvergoeding');
+          row('Toiletvergoeding', fmtHours(c.toiletHours) + ' uur', fmtEuro(c.wage), fmtEuro(c.toiletPay));
+          y += 3;
+        }
+
+        if (c.fixedAllowances.length > 0) {
+          sectionHeader('Vaste vergoedingen');
+          c.fixedAllowances.forEach(al => {
+            row(al.description || 'Vergoeding', '', '', fmtEuro(Number(al.amount) || 0));
+          });
+          if (c.fixedAllowances.length > 1) {
+            doc.setDrawColor(230, 230, 225);
+            doc.line(MARGIN, y - 2, PAGE_W - MARGIN, y - 2);
+            row('Totaal vaste vergoedingen', '', '', fmtEuro(c.totalFixedAllowances), true);
+          }
+          y += 3;
+        }
+
+        if (c.projectBonuses.length > 0) {
+          sectionHeader('Project bonussen');
+          c.projectBonuses.forEach(pb => row(pb.projectName, pb.sales + ' sales', '', fmtEuro(pb.bonus)));
+          doc.setDrawColor(230, 230, 225);
+          doc.line(MARGIN, y - 2, PAGE_W - MARGIN, y - 2);
+          row('Totaal projectbonussen', '', '', fmtEuro(c.totalProjectBonus), true);
+          y += 3;
+        }
+
+        if (c.hourBonus > 0) {
+          sectionHeader('Uren-bonus');
+          const tier = c.hourBonusTier;
+          const label = `Uren-bonus (vanaf ${tier?.minHours || 0} uur)`;
+          row(label, fmtHours(c.qualifyingHours) + ' uur', '', fmtEuro(c.hourBonus));
+          y += 3;
+        }
+
+        if (c.manualBonuses.length > 0) {
+          sectionHeader('Incentive bonussen');
+          c.manualBonuses.forEach(b => {
+            const label = b.description || 'Bonus';
+            const salesQty = b.sales ? `${b.sales} sales` : '';
+            row(label, salesQty, '', fmtEuro(Number(b.amount) || 0));
+          });
+          doc.setDrawColor(230, 230, 225);
+          doc.line(MARGIN, y - 2, PAGE_W - MARGIN, y - 2);
+          row('Totaal incentive bonussen', '', '', fmtEuro(c.totalManualBonus), true);
+          y += 3;
+        }
+
+        ensureSpace(22);
+        y += 4;
+        doc.setFillColor(...ACCENT); doc.rect(MARGIN, y, PAGE_W - 2 * MARGIN, 16, 'F');
+        doc.setTextColor(255, 255, 255); doc.setFont('helvetica', 'normal'); doc.setFontSize(11);
+        doc.text('TOTAAL BRUTO', MARGIN + 4, y + 10);
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(16);
+        doc.text(fmtEuro(c.totalGross), PAGE_W - MARGIN - 4, y + 10.5, { align: 'right' });
+
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(...MUTED);
+        const dateStr = new Date().toLocaleDateString('nl-NL');
+        doc.text(`Loonstrook gegenereerd op ${dateStr}`, MARGIN, PAGE_H - 12);
+        doc.text('Bruto bedragen — eventuele inhoudingen niet meegenomen', PAGE_W - MARGIN, PAGE_H - 12, { align: 'right' });
+
+        return doc;
+      }
+
+      function getPdfFilename(agent) {
+        const monthLabel = fmtMonth(currentMonth); // e.g. "mei 2026"
+        const display = (agent.nickname || agent.name || 'Medewerker').trim();
+        const sanitized = display.replace(/[\/\\:*?"<>|]/g, '').trim();
+        return `${sanitized} loon ${monthLabel}.pdf`;
+      }
+
+      function generatePDF(agent) {
+        const doc = buildPdfDoc(agent);
+        if (!doc) return;
+        doc.save(getPdfFilename(agent));
+      }
+
+      async function generateAllPDFs() {
+        if (!window.jspdf) { notify('PDF library nog aan het laden...', 'error'); return; }
+        if (!window.JSZip) { notify('ZIP library nog aan het laden, probeer over een paar seconden...', 'error'); return; }
+        if (agents.length === 0) return;
+        setGenerating(true);
+        try {
+          const zip = new window.JSZip();
+          for (const agent of agents) {
+            const doc = buildPdfDoc(agent);
+            if (!doc) continue;
+            const blob = doc.output('blob');
+            zip.file(getPdfFilename(agent), blob);
+          }
+          const zipBlob = await zip.generateAsync({ type: 'blob' });
+          const url = URL.createObjectURL(zipBlob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `Loonstroken ${fmtMonth(currentMonth)}.zip`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          notify(`${agents.length} loonstroken in één ZIP gedownload`);
+        } catch (e) {
+          notify('Fout bij ZIP maken: ' + e.message, 'error');
+        } finally {
+          setGenerating(false);
+        }
+      }
+
+      function generatePayoutSheet() {
+        if (!window.XLSX) { notify('Excel library nog aan het laden, probeer over een paar seconden...', 'error'); return; }
+        if (agents.length === 0) { notify('Geen medewerkers om te exporteren', 'error'); return; }
+        const XLSX = window.XLSX;
+
+        const headers = ['REKENINGNAAM', 'Rekeningnummer', 'Swiftcode', 'R.Soort', 'Totaal Agents loon', 'NAAM', 'HOE'];
+        const rows = [headers];
+        let total = 0;
+        for (const a of agents) {
+          const calc = computeAgentPayroll(a);
+          total += calc.totalGross;
+          rows.push([
+            a.name || '',
+            a.bankAccount || '',
+            a.swiftCode || '',
+            a.accountCurrency || 'EUR',
+            Number(calc.totalGross.toFixed(2)),
+            a.nickname || '',
+            a.payoutMethod === 'cash' ? 'Cash' : (a.payoutMethod === 'rekening' ? 'Rekening' : '')
+          ]);
+        }
+        rows.push(['TOTAAL', '', '', '', Number(total.toFixed(2)), '', '']);
+
+        const ws = XLSX.utils.aoa_to_sheet(rows);
+
+        // Column widths
+        ws['!cols'] = [
+          { wch: 28 }, { wch: 18 }, { wch: 14 }, { wch: 8 },
+          { wch: 18 }, { wch: 14 }, { wch: 12 }
+        ];
+
+        // Format euro column (E) with currency, set bold for header & TOTAAL row
+        const range = XLSX.utils.decode_range(ws['!ref']);
+        const totalRowIdx = rows.length - 1;
+        for (let R = range.s.r; R <= range.e.r; R++) {
+          for (let C = range.s.c; C <= range.e.c; C++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: C });
+            const cell = ws[addr];
+            if (!cell) continue;
+            if (!cell.s) cell.s = {};
+            // Euro column
+            if (C === 4 && R > 0) {
+              cell.t = 'n';
+              cell.z = '"€" #,##0.00';
+            }
+            // Header bold
+            if (R === 0) {
+              cell.s.font = { bold: true };
+            }
+            // TOTAAL row bold
+            if (R === totalRowIdx) {
+              cell.s.font = { bold: true, sz: 12 };
+            }
+          }
+        }
+
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, fmtMonth(currentMonth) || 'Uitbetaling');
+        const fname = `Uitbetaling_${currentMonth}.xlsx`;
+        XLSX.writeFile(wb, fname);
+        notify(`Excel-bestand gedownload: ${fname}`);
+      }
+
+      /* ---------- Match summary & unmatched names ---------- */
+      const csvMatchSummary = useMemo(() => {
+        const known = new Set();
+        agents.forEach(a => agentMatchKeys(a).forEach(k => known.add(k)));
+        const unique = new Map();
+        timeEntries.forEach(e => {
+          if (!unique.has(e.agentKey)) unique.set(e.agentKey, { name: e.agentDisplayName || e.agentKey, matched: known.has(e.agentKey) });
+        });
+        const all = Array.from(unique.entries()).map(([key, v]) => ({ key, name: v.name, matched: v.matched }));
+        return {
+          totalCsvAgents: all.length,
+          matchedCount: all.filter(x => x.matched).length,
+          unmatched: all.filter(x => !x.matched)
+        };
+      }, [timeEntries, agents]);
+      const unmatchedCsvNames = csvMatchSummary.unmatched;
+
+      function addAgentFromCsv(displayName) {
+        setAgents(a => [...a, { id: genId(), name: displayName, nickname: displayName, hourlyWage: 0, bankAccount: '', swiftCode: '', accountCurrency: 'EUR', payoutMethod: 'rekening', fixedAllowances: [] }]);
+        notify(`${displayName} toegevoegd — pas naam/uurloon aan in Instellingen`);
+      }
+
+      function linkCsvNameToAgent(csvName, agentId) {
+        const agent = agents.find(a => a.id === agentId);
+        if (!agent) return;
+        setAgents(a => a.map(x => x.id === agentId ? { ...x, nickname: csvName } : x));
+        notify(`${csvName} gekoppeld aan ${agent.name || agent.nickname || 'medewerker'}`);
+      }
+
+      /* ---------- Render ---------- */
+      if (loading) {
+        return (
+          <div style={baseStyle} className="min-h-screen flex items-center justify-center bg-stone-100">
+            <div className="text-stone-500">Laden...</div>
+          </div>
+        );
+      }
+
+      return (
+        <div style={baseStyle} className="min-h-screen bg-stone-100">
+          <style>{globalCss}</style>
+
+          {notification && (
+            <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg text-sm font-medium flex items-center gap-2 ${
+              notification.kind === 'error' ? 'bg-rose-600 text-white' : 'bg-emerald-700 text-white'
+            }`}>
+              {notification.kind === 'error' ? <AlertCircle size={16} /> : <CheckCircle2 size={16} />}
+              {notification.msg}
+            </div>
+          )}
+
+          <header className="bg-white border-b border-stone-200">
+            <div className="max-w-6xl mx-auto px-6 py-5 flex items-center justify-between flex-wrap gap-3">
+              <div className="flex items-center gap-3">
+                {company.logo ? (
+                  <img src={company.logo} alt="logo" className="w-10 h-10 object-contain rounded" />
+                ) : (
+                  <div className="w-10 h-10 rounded bg-emerald-900 text-white flex items-center justify-center">
+                    <Building2 size={20} />
+                  </div>
+                )}
+                <div>
+                  <div style={displayFont} className="text-2xl leading-none text-stone-900">
+                    {company.name || 'Loondashboard'}
+                  </div>
+                  <div className="text-xs text-stone-500 mt-0.5 tracking-wide uppercase">Personeelsadministratie</div>
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-xs text-stone-500 tracking-wide uppercase">Periode</div>
+                <input
+                  type="month"
+                  value={currentMonth}
+                  onChange={(e) => setCurrentMonth(e.target.value)}
+                  className="bg-transparent text-stone-900 font-semibold border-none outline-none text-right"
+                />
+              </div>
+            </div>
+
+            <div className="max-w-6xl mx-auto px-6">
+              <div className="flex gap-1 overflow-x-auto">
+                <TabBtn active={activeTab === 'setup'} onClick={() => setActiveTab('setup')} icon={<Settings size={15} />}>Instellingen</TabBtn>
+                <TabBtn active={activeTab === 'month'} onClick={() => setActiveTab('month')} icon={<Calendar size={15} />}>Loonperiode</TabBtn>
+                <TabBtn active={activeTab === 'payslips'} onClick={() => setActiveTab('payslips')} icon={<FileText size={15} />}>Loonstroken</TabBtn>
+              </div>
+            </div>
+          </header>
+
+          <main className="max-w-6xl mx-auto px-6 py-8">
+            {activeTab === 'setup' && (
+              <SetupTab
+                company={company} setCompany={setCompany} handleLogoUpload={handleLogoUpload}
+                agents={agents} addAgent={addAgent} updateAgent={updateAgent} removeAgent={removeAgent}
+                addFixedAllowance={addFixedAllowance} updateFixedAllowance={updateFixedAllowance} removeFixedAllowance={removeFixedAllowance}
+                projects={projects} addProject={addProject} updateProject={updateProject} removeProject={removeProject}
+                addTier={addTier} updateTier={updateTier} removeTier={removeTier}
+                hourBonusTiers={hourBonusTiers} addHourBonusTier={addHourBonusTier}
+                updateHourBonusTier={updateHourBonusTier} removeHourBonusTier={removeHourBonusTier}
+                toiletAllowanceHours={toiletAllowanceHours} setToiletAllowanceHours={setToiletAllowanceHours}
+              />
+            )}
+            {activeTab === 'month' && (
+              <MonthTab
+                currentMonth={currentMonth}
+                timeEntries={timeEntries} handleCsvUpload={handleCsvUpload} clearTimeEntries={clearTimeEntries}
+                addTimeEntry={addTimeEntry} updateTimeEntry={updateTimeEntry} removeTimeEntry={removeTimeEntry}
+                unmatchedCsvNames={unmatchedCsvNames} addAgentFromCsv={addAgentFromCsv}
+                linkCsvNameToAgent={linkCsvNameToAgent}
+                csvMatchSummary={csvMatchSummary}
+                holidays={holidays} addHoliday={addHoliday} updateHoliday={updateHoliday} removeHoliday={removeHoliday}
+                agents={agents} projects={projects}
+                getAgentMD={getAgentMD}
+                setIncentiveHours={setIncentiveHours} setSales={setSales}
+                addManualBonus={addManualBonus} updateManualBonus={updateManualBonus} removeManualBonus={removeManualBonus}
+                addSystemOutage={addSystemOutage} updateSystemOutage={updateSystemOutage} removeSystemOutage={removeSystemOutage}
+              />
+            )}
+            {activeTab === 'payslips' && (
+              <PayslipsTab
+                agents={agents} computeAgentPayroll={computeAgentPayroll}
+                generatePDF={generatePDF} generateAllPDFs={generateAllPDFs}
+                generatePayoutSheet={generatePayoutSheet}
+                jsPdfLoaded={jsPdfLoaded} generating={generating}
+                currentMonth={currentMonth}
+              />
+            )}
+          </main>
+
+          <footer className="max-w-6xl mx-auto px-6 py-6 text-center text-xs text-stone-400">
+            Wijzigingen worden automatisch opgeslagen
+          </footer>
+        </div>
+      );
+    }
+
+    /* ------------------------- Tabs ------------------------- */
+    function TabBtn({ active, onClick, icon, children }) {
+      return (
+        <button onClick={onClick}
+          className={`px-5 py-3 text-sm font-medium flex items-center gap-2 border-b-2 transition-colors whitespace-nowrap ${
+            active ? 'text-emerald-900 border-emerald-900' : 'text-stone-500 border-transparent hover:text-stone-800'
+          }`}
+        >{icon}{children}</button>
+      );
+    }
+
+    /* ------------------------- Setup Tab ------------------------- */
+    function SetupTab({ company, setCompany, handleLogoUpload, agents, addAgent, updateAgent, removeAgent,
+      addFixedAllowance, updateFixedAllowance, removeFixedAllowance,
+      projects, addProject, updateProject, removeProject, addTier, updateTier, removeTier,
+      hourBonusTiers, addHourBonusTier, updateHourBonusTier, removeHourBonusTier,
+      toiletAllowanceHours, setToiletAllowanceHours }) {
+
+      const [agentSearch, setAgentSearch] = useState('');
+      const filteredAgents = useMemo(
+        () => agents.filter(a => agentMatchesSearch(a, agentSearch)),
+        [agents, agentSearch]
+      );
+
+      return (
+        <div className="space-y-8">
+          <Card icon={<Building2 size={18} />} title="Bedrijfsgegevens">
+            <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-6 items-start">
+              <div>
+                <Label>Bedrijfsnaam</Label>
+                <Input value={company.name} onChange={(e) => setCompany(c => ({ ...c, name: e.target.value }))} placeholder="bv. Callcenter Nederland B.V." />
+              </div>
+              <div>
+                <Label>Logo</Label>
+                <div className="flex items-center gap-3">
+                  {company.logo ? (
+                    <img src={company.logo} alt="logo" className="w-16 h-16 object-contain border border-stone-200 rounded bg-white p-1" />
+                  ) : (
+                    <div className="w-16 h-16 border-2 border-dashed border-stone-300 rounded flex items-center justify-center text-stone-400">
+                      <ImageIcon size={20} />
+                    </div>
+                  )}
+                  <div className="flex flex-col gap-1">
+                    <label className="cursor-pointer text-sm px-3 py-1.5 bg-stone-900 text-white rounded hover:bg-stone-800 inline-flex items-center gap-1.5">
+                      <Upload size={13} /> Upload
+                      <input type="file" accept="image/*" onChange={handleLogoUpload} className="hidden" />
+                    </label>
+                    {company.logo && (
+                      <button onClick={() => setCompany(c => ({ ...c, logo: null }))} className="text-xs text-stone-500 hover:text-rose-600">Verwijderen</button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </Card>
+
+          <Card icon={<Users size={18} />} title={`Medewerkers${agents.length > 0 ? ` (${agents.length})` : ''}`} action={<BtnPrimary onClick={addAgent}><Plus size={14} /> Toevoegen</BtnPrimary>}>
+            {agents.length === 0 ? (
+              <Empty>Nog geen medewerkers. Voeg ze handmatig toe of upload een CSV in de Loonperiode-tab.</Empty>
+            ) : (
+              <>
+                {agents.length > 5 && (
+                  <div className="mb-3">
+                    <SearchBar value={agentSearch} onChange={setAgentSearch} placeholder="Zoek medewerker op naam of bijnaam..." />
+                    {agentSearch && (
+                      <div className="text-xs text-stone-500 mt-1.5">{filteredAgents.length} van {agents.length} getoond</div>
+                    )}
+                  </div>
+                )}
+                {filteredAgents.length === 0 ? (
+                  <Empty>Geen medewerkers gevonden voor "{agentSearch}".</Empty>
+                ) : (
+                  <div className="divide-y divide-stone-100 -mx-2">
+                    {filteredAgents.map(a => (
+                      <AgentRow key={a.id} agent={a} updateAgent={updateAgent} removeAgent={removeAgent}
+                        addFixedAllowance={addFixedAllowance} updateFixedAllowance={updateFixedAllowance} removeFixedAllowance={removeFixedAllowance} />
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </Card>
+
+          <Card icon={<Briefcase size={18} />} title="Projecten & bonusstaffels" action={<BtnPrimary onClick={addProject}><Plus size={14} /> Project</BtnPrimary>}>
+            {projects.length === 0 ? (
+              <Empty>Voeg projecten toe waar agents sales op maken. Per project kun je verschillende bonus-staffels instellen.</Empty>
+            ) : (
+              <div className="space-y-5">
+                {projects.map(p => (
+                  <ProjectEditor key={p.id} project={p}
+                    updateProject={updateProject} removeProject={removeProject}
+                    addTier={addTier} updateTier={updateTier} removeTier={removeTier} />
+                ))}
+              </div>
+            )}
+            {projects.length > 0 && (
+              <div className="mt-4 p-3 bg-stone-50 border border-stone-200 rounded text-xs text-stone-600">
+                <strong>Hoe werkt een staffel?</strong> Bij <em>50–75 sales</em> met basis €25 en €0,25 per sale: 60 sales = €25 + (60−50) × €0,25 = <strong>€27,50</strong>. Onder de minimum-sales geen bonus. Boven de hoogste max wordt de hoogste staffel toegepast (gecapped op die max).
+              </div>
+            )}
+          </Card>
+
+          <Card icon={<Clock size={18} />} title="Uren-bonus" action={<BtnPrimary onClick={addHourBonusTier}><Plus size={14} /> Drempel</BtnPrimary>}>
+            <div className="text-xs text-stone-500 mb-3">
+              Bonus op basis van totaal uren in de maand. Telt mee: werkuren + incentive uren + systeemstoringen. De hoogste drempel die de agent haalt wordt toegepast.
+            </div>
+            {hourBonusTiers.length === 0 ? (
+              <Empty>Nog geen drempels ingesteld.</Empty>
+            ) : (
+              <div className="space-y-1.5">
+                <div className="grid grid-cols-[120px_120px_40px] gap-2 pb-1 text-xs text-stone-500 uppercase tracking-wider font-medium">
+                  <div>Vanaf uren</div>
+                  <div>Bedrag €</div>
+                  <div></div>
+                </div>
+                {hourBonusTiers.map(t => (
+                  <div key={t.id} className="grid grid-cols-[120px_120px_40px] gap-2 items-center">
+                    <Input type="number" value={t.minHours} onChange={(e) => updateHourBonusTier(t.id, 'minHours', parseFloat(e.target.value) || 0)} />
+                    <div className="relative">
+                      <span className="absolute left-2 top-1/2 -translate-y-1/2 text-stone-400 text-xs">€</span>
+                      <Input type="number" step="0.01" value={t.amount} onChange={(e) => updateHourBonusTier(t.id, 'amount', parseFloat(e.target.value) || 0)} className="pl-6" />
+                    </div>
+                    <button onClick={() => removeHourBonusTier(t.id)} className="text-stone-400 hover:text-rose-600 p-1"><X size={14} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+
+          <Card icon={<Sparkles size={18} />} title="Toiletvergoeding">
+            <div className="text-xs text-stone-500 mb-3">
+              Iedere medewerker krijgt automatisch dit aantal uren × eigen uurloon erbij. Op 0 zetten om uit te schakelen.
+            </div>
+            <div className="grid grid-cols-[1fr_140px] gap-3 items-center max-w-md">
+              <div className="text-sm text-stone-700">Aantal uren per medewerker</div>
+              <Input type="number" step="0.5" value={toiletAllowanceHours}
+                onChange={(e) => setToiletAllowanceHours(parseFloat(e.target.value) || 0)} />
+            </div>
+          </Card>
+        </div>
+      );
+    }
+
+    function AgentRow({ agent, updateAgent, removeAgent, addFixedAllowance, updateFixedAllowance, removeFixedAllowance }) {
+      const [open, setOpen] = useState(false);
+      const allowances = agent.fixedAllowances || [];
+      const allowanceTotal = allowances.reduce((s, a) => s + (Number(a.amount) || 0), 0);
+      return (
+        <div>
+          <div className="flex items-center gap-2 py-2 px-2">
+            <button onClick={() => setOpen(o => !o)} className="text-stone-400 hover:text-stone-700 flex-shrink-0">
+              {open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </button>
+            <Input value={agent.name} onChange={(e) => updateAgent(agent.id, 'name', e.target.value)} placeholder="Volledige naam" className="flex-1 min-w-0" />
+            <div className="relative w-[120px] flex-shrink-0">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 text-sm">€</span>
+              <Input type="number" step="0.01" value={agent.hourlyWage} onChange={(e) => updateAgent(agent.id, 'hourlyWage', parseFloat(e.target.value) || 0)} className="pl-7" placeholder="0,00" />
+            </div>
+            <button onClick={() => removeAgent(agent.id)} className="text-stone-400 hover:text-rose-600 p-2 flex-shrink-0"><Trash2 size={15} /></button>
+          </div>
+          {open && (
+            <div className="px-9 pb-3 bg-stone-50/50">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+                <div>
+                  <Label>Bijnaam (voor uitbetaling)</Label>
+                  <Input value={agent.nickname || ''} onChange={(e) => updateAgent(agent.id, 'nickname', e.target.value)} placeholder="Bijv. voornaam" />
+                </div>
+                <div>
+                  <Label>Uitbetaling</Label>
+                  <select value={agent.payoutMethod || 'rekening'}
+                    onChange={(e) => updateAgent(agent.id, 'payoutMethod', e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-stone-200 rounded bg-white text-stone-900 outline-none focus:border-emerald-700">
+                    <option value="rekening">Rekening</option>
+                    <option value="cash">Cash</option>
+                  </select>
+                </div>
+                <div>
+                  <Label>Rekeningnummer</Label>
+                  <Input value={agent.bankAccount || ''} onChange={(e) => updateAgent(agent.id, 'bankAccount', e.target.value)} placeholder="Bijv. 1000272599" />
+                </div>
+                <div>
+                  <Label>Swiftcode</Label>
+                  <Input value={agent.swiftCode || ''} onChange={(e) => updateAgent(agent.id, 'swiftCode', e.target.value)} placeholder="Bijv. FBNASRPAXXX" />
+                </div>
+                <div>
+                  <Label>Rekeningsoort</Label>
+                  <select value={agent.accountCurrency || 'EUR'}
+                    onChange={(e) => updateAgent(agent.id, 'accountCurrency', e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-stone-200 rounded bg-white text-stone-900 outline-none focus:border-emerald-700">
+                    <option value="EUR">EUR</option>
+                    <option value="SRD">SRD</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="border-t border-stone-200 pt-3">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <Label>Vaste maandelijkse vergoedingen</Label>
+                    {allowanceTotal > 0 && (
+                      <span className="text-xs text-emerald-800 font-medium">+ {fmtEuro(allowanceTotal)} / maand</span>
+                    )}
+                  </div>
+                  <button onClick={() => addFixedAllowance(agent.id)} className="text-xs text-emerald-800 hover:text-emerald-900 flex items-center gap-1">
+                    <Plus size={12} /> Toevoegen
+                  </button>
+                </div>
+                <div className="text-xs text-stone-500 mb-2">Bijv. €100 voor verantwoordelijkheidsfunctie of €20 voor beltegoed. Wordt elke maand automatisch meegenomen.</div>
+                {allowances.length === 0 ? (
+                  <div className="text-sm text-stone-400">Geen vaste vergoedingen.</div>
+                ) : (
+                  <div className="space-y-1.5">
+                    <div className="grid grid-cols-[1fr_120px_30px] gap-2 text-[10px] text-stone-500 uppercase tracking-wider font-medium">
+                      <div>Omschrijving</div><div>Bedrag</div><div></div>
+                    </div>
+                    {allowances.map(al => (
+                      <div key={al.id} className="grid grid-cols-[1fr_120px_30px] gap-2 items-center">
+                        <Input value={al.description} onChange={(e) => updateFixedAllowance(agent.id, al.id, 'description', e.target.value)} placeholder="Bijv. Verantwoordelijkheidsfunctie" />
+                        <div className="relative">
+                          <span className="absolute left-2 top-1/2 -translate-y-1/2 text-stone-400 text-xs">€</span>
+                          <Input type="number" step="0.01" value={al.amount} onChange={(e) => updateFixedAllowance(agent.id, al.id, 'amount', parseFloat(e.target.value) || 0)} className="pl-6" />
+                        </div>
+                        <button onClick={() => removeFixedAllowance(agent.id, al.id)} className="text-stone-400 hover:text-rose-600"><X size={14} /></button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function ProjectEditor({ project, updateProject, removeProject, addTier, updateTier, removeTier }) {
+      const [open, setOpen] = useState(true);
+      return (
+        <div className="border border-stone-200 rounded-lg overflow-hidden">
+          <div className="flex items-center gap-2 p-3 bg-stone-50">
+            <button onClick={() => setOpen(o => !o)} className="text-stone-500 hover:text-stone-800">
+              {open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </button>
+            <Input value={project.name} onChange={(e) => updateProject(project.id, 'name', e.target.value)} placeholder="Projectnaam" className="flex-1 bg-white" />
+            <button onClick={() => removeProject(project.id)} className="text-stone-400 hover:text-rose-600 p-2"><Trash2 size={15} /></button>
+          </div>
+          {open && (
+            <div className="p-4 bg-white">
+              {project.tiers.length === 0 ? (
+                <div className="text-sm text-stone-500 mb-3">Nog geen staffels.</div>
+              ) : (
+                <div>
+                  <div className="grid grid-cols-[80px_80px_100px_100px_40px] gap-2 pb-1 text-xs text-stone-500 uppercase tracking-wider font-medium">
+                    <div>Min sales</div><div>Max sales</div><div>Basis €</div><div>Per sale €</div><div></div>
+                  </div>
+                  <div className="space-y-1.5">
+                    {project.tiers.map(t => (
+                      <div key={t.id} className="grid grid-cols-[80px_80px_100px_100px_40px] gap-2 items-center">
+                        <Input type="number" value={t.minSales} onChange={(e) => updateTier(project.id, t.id, 'minSales', parseFloat(e.target.value) || 0)} />
+                        <Input type="number" value={t.maxSales} onChange={(e) => updateTier(project.id, t.id, 'maxSales', parseFloat(e.target.value) || 0)} />
+                        <Input type="number" step="0.01" value={t.base} onChange={(e) => updateTier(project.id, t.id, 'base', parseFloat(e.target.value) || 0)} />
+                        <Input type="number" step="0.01" value={t.perSale} onChange={(e) => updateTier(project.id, t.id, 'perSale', parseFloat(e.target.value) || 0)} />
+                        <button onClick={() => removeTier(project.id, t.id)} className="text-stone-400 hover:text-rose-600 p-1"><X size={14} /></button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <button onClick={() => addTier(project.id)} className="mt-3 text-sm text-emerald-800 hover:text-emerald-900 flex items-center gap-1">
+                <Plus size={14} /> Staffel toevoegen
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ------------------------- Month Tab ------------------------- */
+    function MonthTab({ currentMonth, timeEntries, handleCsvUpload, clearTimeEntries,
+      addTimeEntry, updateTimeEntry, removeTimeEntry,
+      unmatchedCsvNames, addAgentFromCsv, linkCsvNameToAgent, csvMatchSummary,
+      holidays, addHoliday, updateHoliday, removeHoliday,
+      agents, projects, getAgentMD,
+      setIncentiveHours, setSales, addManualBonus, updateManualBonus, removeManualBonus,
+      addSystemOutage, updateSystemOutage, removeSystemOutage }) {
+
+      const [expandedAgent, setExpandedAgent] = useState(null);
+      const [showAddForm, setShowAddForm] = useState(false);
+      const [agentSearch, setAgentSearch] = useState('');
+      const filteredAgents = useMemo(
+        () => agents.filter(a => agentMatchesSearch(a, agentSearch)),
+        [agents, agentSearch]
+      );
+
+      return (
+        <div className="space-y-8">
+          <div>
+            <div style={displayFont} className="text-3xl text-stone-900">{fmtMonth(currentMonth)}</div>
+            <div className="text-sm text-stone-500 mt-1">Loonperiode</div>
+          </div>
+
+          {/* CSV upload */}
+          <Card icon={<Upload size={18} />} title="Uren-CSV uploaden">
+            <div className="flex items-center gap-3 flex-wrap">
+              <label className="cursor-pointer px-4 py-2 bg-emerald-900 text-white rounded hover:bg-emerald-800 inline-flex items-center gap-2 text-sm font-medium">
+                <Upload size={14} /> Bestand kiezen
+                <input type="file" accept=".csv" onChange={handleCsvUpload} className="hidden" />
+              </label>
+              {timeEntries.length > 0 && (
+                <span className="text-sm text-stone-600">{timeEntries.length} regel(s) totaal</span>
+              )}
+            </div>
+            <p className="text-xs text-stone-500 mt-3">
+              Verwachte kolommen: <strong>agent, project, sales, begeleiding, nawerktijd, in gesprek, uitbellend, beschikbaar</strong> — tijden als HH:MM:SS. Eén agent kan meerdere regels hebben (bv. per project). De waarde in de <em>agent</em>-kolom wordt gematcht aan de <strong>bijnaam</strong> (of volledige naam) in Instellingen.
+            </p>
+            {csvMatchSummary && csvMatchSummary.totalCsvAgents > 0 && (
+              <div className="mt-4 grid grid-cols-3 gap-3">
+                <div className="p-3 bg-stone-50 border border-stone-200 rounded">
+                  <div className="text-xs text-stone-500 uppercase tracking-wider">In CSV</div>
+                  <div className="text-2xl font-semibold text-stone-900 tabular-nums">{csvMatchSummary.totalCsvAgents}</div>
+                  <div className="text-xs text-stone-500">unieke namen</div>
+                </div>
+                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded">
+                  <div className="text-xs text-emerald-700 uppercase tracking-wider">Gematcht</div>
+                  <div className="text-2xl font-semibold text-emerald-900 tabular-nums">{csvMatchSummary.matchedCount}</div>
+                  <div className="text-xs text-emerald-700">aan medewerkers</div>
+                </div>
+                <div className={`p-3 border rounded ${csvMatchSummary.unmatched.length > 0 ? 'bg-amber-50 border-amber-200' : 'bg-stone-50 border-stone-200'}`}>
+                  <div className={`text-xs uppercase tracking-wider ${csvMatchSummary.unmatched.length > 0 ? 'text-amber-700' : 'text-stone-500'}`}>Niet gematcht</div>
+                  <div className={`text-2xl font-semibold tabular-nums ${csvMatchSummary.unmatched.length > 0 ? 'text-amber-900' : 'text-stone-900'}`}>{csvMatchSummary.unmatched.length}</div>
+                  <div className={`text-xs ${csvMatchSummary.unmatched.length > 0 ? 'text-amber-700' : 'text-stone-500'}`}>onbekende namen</div>
+                </div>
+              </div>
+            )}
+            {unmatchedCsvNames.length > 0 && (
+              <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded">
+                <div className="text-sm text-amber-900 font-medium mb-1">Onbekende namen uit CSV:</div>
+                <div className="text-xs text-amber-800 mb-3">Koppel aan een bestaande medewerker (de naam wordt opgeslagen als bijnaam) óf voeg toe als nieuwe medewerker.</div>
+                <div className="space-y-1.5">
+                  {unmatchedCsvNames.map(u => (
+                    <UnmatchedRow key={u.key} csvName={u.name}
+                      agents={agents}
+                      onLink={(agentId) => linkCsvNameToAgent(u.name, agentId)}
+                      onAddNew={() => addAgentFromCsv(u.name)} />
+                  ))}
+                </div>
+              </div>
+            )}
+          </Card>
+
+          {/* Time entries */}
+          <Card icon={<Clock size={18} />} title="Uren-regels"
+            action={
+              <div className="flex items-center gap-2">
+                {timeEntries.length > 0 && (
+                  <button onClick={clearTimeEntries} className="text-sm text-stone-500 hover:text-rose-600">Alle wissen</button>
+                )}
+                <BtnPrimary onClick={() => setShowAddForm(true)}><Plus size={14} /> Handmatig toevoegen</BtnPrimary>
+              </div>
+            }>
+            {showAddForm && (
+              <AddTimeEntryForm
+                agents={agents}
+                projects={projects}
+                onAdd={(entry) => { addTimeEntry(entry); setShowAddForm(false); }}
+                onCancel={() => setShowAddForm(false)}
+              />
+            )}
+
+            {timeEntries.length === 0 ? (
+              !showAddForm && <Empty>Nog geen uren-regels. Upload een CSV of voeg handmatig toe.</Empty>
+            ) : (
+              <TimeEntriesList
+                entries={timeEntries} agents={agents} projects={projects}
+                onUpdate={updateTimeEntry} onRemove={removeTimeEntry}
+              />
+            )}
+          </Card>
+
+          {/* Holidays */}
+          <Card icon={<Sparkles size={18} />} title="Feestdagen" action={<BtnPrimary onClick={addHoliday}><Plus size={14} /> Feestdag</BtnPrimary>}>
+            {holidays.length === 0 ? (
+              <Empty>Geen feestdagen voor deze maand.</Empty>
+            ) : (
+              <div className="space-y-2">
+                <div className="grid grid-cols-[140px_1fr_140px_40px] gap-3 pb-1 text-xs text-stone-500 uppercase tracking-wider font-medium">
+                  <div>Datum</div><div>Omschrijving</div><div>Uren per medewerker</div><div></div>
+                </div>
+                {holidays.map(h => (
+                  <div key={h.id} className="grid grid-cols-[140px_1fr_140px_40px] gap-3 items-center">
+                    <Input type="date" value={h.date} onChange={(e) => updateHoliday(h.id, 'date', e.target.value)} />
+                    <Input value={h.name} onChange={(e) => updateHoliday(h.id, 'name', e.target.value)} placeholder="Bijv. Hemelvaart" />
+                    <Input type="number" step="0.5" value={h.hoursPerAgent} onChange={(e) => updateHoliday(h.id, 'hoursPerAgent', parseFloat(e.target.value) || 0)} />
+                    <button onClick={() => removeHoliday(h.id)} className="text-stone-400 hover:text-rose-600 p-2"><Trash2 size={15} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+
+          {/* Per-agent sales/incentives/bonuses */}
+          <Card icon={<Users size={18} />} title="Sales, incentives & bonussen per medewerker">
+            {agents.length === 0 ? (
+              <Empty>Voeg eerst medewerkers toe in Instellingen.</Empty>
+            ) : (
+              <>
+                {agents.length > 5 && (
+                  <div className="mb-3">
+                    <SearchBar value={agentSearch} onChange={setAgentSearch} placeholder="Zoek medewerker op naam of bijnaam..." />
+                    {agentSearch && (
+                      <div className="text-xs text-stone-500 mt-1.5">{filteredAgents.length} van {agents.length} getoond</div>
+                    )}
+                  </div>
+                )}
+                {filteredAgents.length === 0 ? (
+                  <Empty>Geen medewerkers gevonden.</Empty>
+                ) : (
+                  <div className="divide-y divide-stone-100">
+                    {filteredAgents.map(a => {
+                      const md = getAgentMD(a.id);
+                      const open = expandedAgent === a.id;
+                      const keySet = new Set(agentMatchKeys(a));
+                      const agentEntries = timeEntries.filter(e => keySet.has(e.agentKey));
+                      const totalSecs = agentEntries.reduce((s, e) => s + entryTotalSecs(e), 0);
+                      const totalHours = secsToHours(totalSecs);
+
+                      return (
+                    <div key={a.id} className="py-3">
+                      <button
+                        onClick={() => setExpandedAgent(open ? null : a.id)}
+                        className="w-full flex items-center justify-between text-left hover:bg-stone-50 px-2 py-1.5 rounded -mx-2"
+                      >
+                        <div className="flex items-center gap-3">
+                          {open ? <ChevronUp size={16} className="text-stone-400" /> : <ChevronDown size={16} className="text-stone-400" />}
+                          <div>
+                            <div className="font-medium text-stone-900">{a.name || <span className="text-stone-400">Naamloos</span>}</div>
+                            <div className="text-xs text-stone-500 mt-0.5">
+                              {agentEntries.length > 0 ? `${fmtHours(totalHours)} uur` : 'geen uren'} · uurloon {fmtEuro(a.hourlyWage)}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="text-xs text-stone-500">
+                          {(md.manualBonuses?.length || 0) > 0 && <span className="mr-3">{md.manualBonuses.length} bonus(sen)</span>}
+                          {(md.incentiveHours || 0) > 0 && <span className="mr-3">+{fmtHours(md.incentiveHours)} inc. uur</span>}
+                        </div>
+                      </button>
+
+                      {open && (
+                        <div className="px-2 pt-4 pb-2 grid grid-cols-1 md:grid-cols-2 gap-6">
+                          <div>
+                            <div className="text-xs text-stone-500 uppercase tracking-wider font-medium mb-2">Sales per project</div>
+                            {projects.length === 0 ? (
+                              <div className="text-sm text-stone-400">Nog geen projecten.</div>
+                            ) : (
+                              <>
+                                <div className="text-xs text-stone-500 mb-2">Sales komen uit CSV/uren-regels. Vul handmatig in om te overschrijven, leeg om weer CSV-waarde te gebruiken.</div>
+                                <div className="space-y-1.5">
+                                  {projects.map(p => {
+                                    // Sum sales from time entries matching this project name
+                                    const csvSales = agentEntries
+                                      .filter(e => (e.projectName || '').trim().toLowerCase() === (p.name || '').trim().toLowerCase())
+                                      .reduce((sum, e) => sum + (Number(e.sales) || 0), 0);
+                                    const manualOverride = md.sales?.[p.id];
+                                    const hasOverride = manualOverride !== undefined && manualOverride !== null && manualOverride !== '';
+                                    const effectiveSales = hasOverride ? Number(manualOverride) || 0 : csvSales;
+                                    const bonus = calcBonus(effectiveSales, p.tiers);
+                                    return (
+                                      <div key={p.id} className="grid grid-cols-[1fr_60px_90px_100px] gap-2 items-center">
+                                        <div className="text-sm text-stone-700 truncate">{p.name || <em className="text-stone-400">naamloos</em>}</div>
+                                        <div className="text-xs text-stone-500 text-right tabular-nums" title="Sales uit CSV/uren-regels">CSV: {csvSales}</div>
+                                        <Input type="number" value={hasOverride ? manualOverride : ''}
+                                          onChange={(e) => setSales(a.id, p.id, e.target.value === '' ? '' : (parseFloat(e.target.value) || 0))}
+                                          placeholder={`${csvSales}`} />
+                                        <div className="text-sm text-emerald-800 font-medium text-right tabular-nums">{fmtEuro(bonus)}</div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </>
+                            )}
+                          </div>
+
+                          <div className="space-y-4">
+                            <div>
+                              <div className="text-xs text-stone-500 uppercase tracking-wider font-medium mb-2">Incentive uren</div>
+                              <div className="grid grid-cols-[1fr_90px] gap-2 items-center">
+                                <div className="text-sm text-stone-600">Aantal uren</div>
+                                <Input type="number" step="0.25" value={md.incentiveHours || ''} onChange={(e) => setIncentiveHours(a.id, parseFloat(e.target.value) || 0)} placeholder="0" />
+                              </div>
+                            </div>
+
+                            <div>
+                              <div className="flex items-center justify-between mb-2">
+                                <div className="text-xs text-stone-500 uppercase tracking-wider font-medium">Systeemstoringen</div>
+                                <button onClick={() => addSystemOutage(a.id)} className="text-xs text-emerald-800 hover:text-emerald-900 flex items-center gap-1">
+                                  <Plus size={12} /> Toevoegen
+                                </button>
+                              </div>
+                              {(md.systemOutages || []).length === 0 ? (
+                                <div className="text-sm text-stone-400">Geen systeemstoringen.</div>
+                              ) : (
+                                <div className="space-y-1.5">
+                                  <div className="grid grid-cols-[1fr_90px_30px] gap-2 text-[10px] text-stone-500 uppercase tracking-wider font-medium">
+                                    <div>Omschrijving</div>
+                                    <div>Uren</div>
+                                    <div></div>
+                                  </div>
+                                  {md.systemOutages.map(o => (
+                                    <div key={o.id} className="grid grid-cols-[1fr_90px_30px] gap-2 items-center">
+                                      <Input value={o.description} onChange={(e) => updateSystemOutage(a.id, o.id, 'description', e.target.value)} placeholder="Bijv. CRM uitval 12 mei" />
+                                      <Input type="number" step="0.25" value={o.hours} onChange={(e) => updateSystemOutage(a.id, o.id, 'hours', parseFloat(e.target.value) || 0)} placeholder="0" />
+                                      <button onClick={() => removeSystemOutage(a.id, o.id)} className="text-stone-400 hover:text-rose-600"><X size={14} /></button>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+
+                            <div>
+                              <div className="flex items-center justify-between mb-2">
+                                <div className="text-xs text-stone-500 uppercase tracking-wider font-medium">Incentive bonussen</div>
+                                <button onClick={() => addManualBonus(a.id)} className="text-xs text-emerald-800 hover:text-emerald-900 flex items-center gap-1">
+                                  <Plus size={12} /> Toevoegen
+                                </button>
+                              </div>
+                              {(md.manualBonuses || []).length === 0 ? (
+                                <div className="text-sm text-stone-400">Geen incentive bonussen.</div>
+                              ) : (
+                                <div className="space-y-1.5">
+                                  <div className="grid grid-cols-[1fr_70px_90px_30px] gap-2 text-[10px] text-stone-500 uppercase tracking-wider font-medium">
+                                    <div>Omschrijving</div>
+                                    <div>Sales</div>
+                                    <div>Bedrag</div>
+                                    <div></div>
+                                  </div>
+                                  {md.manualBonuses.map(b => (
+                                    <div key={b.id} className="grid grid-cols-[1fr_70px_90px_30px] gap-2 items-center">
+                                      <Input value={b.description} onChange={(e) => updateManualBonus(a.id, b.id, 'description', e.target.value)} placeholder="Omschrijving" />
+                                      <Input type="number" value={b.sales || ''} onChange={(e) => updateManualBonus(a.id, b.id, 'sales', parseFloat(e.target.value) || 0)} placeholder="0" />
+                                      <div className="relative">
+                                        <span className="absolute left-2 top-1/2 -translate-y-1/2 text-stone-400 text-xs">€</span>
+                                        <Input type="number" step="0.01" value={b.amount} onChange={(e) => updateManualBonus(a.id, b.id, 'amount', parseFloat(e.target.value) || 0)} className="pl-6" />
+                                      </div>
+                                      <button onClick={() => removeManualBonus(a.id, b.id)} className="text-stone-400 hover:text-rose-600"><X size={14} /></button>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+          </Card>
+        </div>
+      );
+    }
+
+    /* ------------------------- Add time entry form ------------------------- */
+    function UnmatchedRow({ csvName, agents, onLink, onAddNew }) {
+      const [selectValue, setSelectValue] = useState('');
+      const sortedAgents = useMemo(
+        () => [...agents].filter(a => a.name?.trim() || a.nickname?.trim())
+          .sort((a, b) => (a.name || a.nickname || '').localeCompare(b.name || b.nickname || '')),
+        [agents]
+      );
+
+      function handleSelect(e) {
+        const id = e.target.value;
+        if (!id) return;
+        onLink(id);
+        setSelectValue('');
+      }
+
+      return (
+        <div className="flex items-center gap-2 flex-wrap bg-white border border-amber-200 rounded px-2 py-1.5">
+          <div className="text-sm font-medium text-stone-900 flex-1 min-w-[120px]">{csvName}</div>
+          <select value={selectValue} onChange={handleSelect}
+            className="text-xs px-2 py-1 border border-stone-300 rounded bg-white text-stone-700 outline-none focus:border-emerald-700 max-w-[200px]">
+            <option value="">→ Koppel aan…</option>
+            {sortedAgents.map(a => (
+              <option key={a.id} value={a.id}>{a.name || a.nickname}{a.nickname && a.name && a.name !== a.nickname ? ` (${a.nickname})` : ''}</option>
+            ))}
+          </select>
+          <button onClick={onAddNew} className="text-xs px-2 py-1 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded text-amber-900 whitespace-nowrap">
+            + Nieuwe medewerker
+          </button>
+        </div>
+      );
+    }
+
+    function AddTimeEntryForm({ agents, projects, onAdd, onCancel }) {
+      const validAgents = agents.filter(a => a.name.trim());
+      const [agentId, setAgentId] = useState(validAgents[0]?.id || '');
+      const [projectName, setProjectName] = useState('');
+      const [sales, setSales] = useState(0);
+      const [secs, setSecs] = useState({ begeleiding: 0, nawerktijd: 0, inGesprek: 0, uitbellend: 0, beschikbaar: 0 });
+
+      function submit() {
+        const a = validAgents.find(x => x.id === agentId);
+        if (!a) { alert('Selecteer een medewerker'); return; }
+        const matchKey = (a.nickname || a.name || '').trim().toLowerCase();
+        const displayName = a.nickname || a.name;
+        onAdd({
+          agentKey: matchKey,
+          agentDisplayName: displayName,
+          projectName: projectName.trim(),
+          sales: Number(sales) || 0,
+          begeleiding: secs.begeleiding,
+          nawerktijd: secs.nawerktijd,
+          inGesprek: secs.inGesprek,
+          uitbellend: secs.uitbellend,
+          beschikbaar: secs.beschikbaar
+        });
+      }
+
+      if (validAgents.length === 0) {
+        return (
+          <div className="border border-amber-200 bg-amber-50 rounded-lg p-4 mb-3 text-sm text-amber-900">
+            Voeg eerst een medewerker toe in Instellingen.
+            <button onClick={onCancel} className="ml-3 text-amber-700 underline">Sluiten</button>
+          </div>
+        );
+      }
+
+      return (
+        <div className="border-2 border-emerald-200 bg-emerald-50/30 rounded-lg p-4 mb-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+            <div>
+              <Label>Medewerker</Label>
+              <select value={agentId} onChange={(e) => setAgentId(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-stone-200 rounded bg-white text-stone-900 outline-none focus:border-emerald-700">
+                {validAgents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <Label>Project</Label>
+              <ProjectSelect value={projectName} onChange={setProjectName} projects={projects} />
+              {projects.length === 0 && (
+                <div className="text-xs text-amber-700 mt-1">Voeg projecten toe in Instellingen om uit te kunnen kiezen.</div>
+              )}
+            </div>
+            <div>
+              <Label>Sales</Label>
+              <Input type="number" value={sales || ''} onChange={(e) => setSales(parseFloat(e.target.value) || 0)} placeholder="0" />
+            </div>
+          </div>
+          <Label>Uren (HH:MM, HH:MM:SS of decimaal zoals 5,5)</Label>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mb-4 mt-1.5">
+            {TIME_FIELDS.map(([k, label]) => (
+              <div key={k}>
+                <div className="text-xs text-stone-500 mb-1">{label}</div>
+                <TimeInput value={secs[k]} onChange={(v) => setSecs(s => ({ ...s, [k]: v }))} />
+              </div>
+            ))}
+          </div>
+          <div className="flex gap-2 justify-end">
+            <button onClick={onCancel} className="px-3 py-1.5 text-sm text-stone-600 hover:text-stone-900">Annuleren</button>
+            <BtnPrimary onClick={submit}><Plus size={14} /> Toevoegen</BtnPrimary>
+          </div>
+        </div>
+      );
+    }
+
+    /* ------------------------- Time entries list ------------------------- */
+    function TimeEntriesList({ entries, agents, projects, onUpdate, onRemove }) {
+      const [search, setSearch] = useState('');
+      const groups = useMemo(() => {
+        const g = {};
+        entries.forEach(e => {
+          if (!g[e.agentKey]) g[e.agentKey] = { displayName: e.agentDisplayName || e.agentKey, entries: [] };
+          g[e.agentKey].entries.push(e);
+        });
+        return Object.entries(g).sort((a, b) => a[1].displayName.localeCompare(b[1].displayName));
+      }, [entries]);
+
+      const filteredGroups = useMemo(
+        () => groups.filter(([key, g]) => matchesSearch(g.displayName, search) || matchesSearch(key, search)),
+        [groups, search]
+      );
+
+      const knownAgentKeys = useMemo(() => {
+        const s = new Set();
+        agents.forEach(a => agentMatchKeys(a).forEach(k => s.add(k)));
+        return s;
+      }, [agents]);
+
+      return (
+        <div className="space-y-3">
+          {groups.length > 5 && (
+            <div>
+              <SearchBar value={search} onChange={setSearch} placeholder="Zoek op agent-naam..." />
+              {search && (
+                <div className="text-xs text-stone-500 mt-1.5">{filteredGroups.length} van {groups.length} agents getoond</div>
+              )}
+            </div>
+          )}
+          {filteredGroups.map(([key, group]) => {
+            const totalSecs = group.entries.reduce((s, e) => s + entryTotalSecs(e), 0);
+            const isUnmatched = !knownAgentKeys.has(key);
+            return (
+              <div key={key} className="border border-stone-200 rounded-lg overflow-hidden">
+                <div className="flex items-center justify-between px-3 py-2 bg-stone-50 border-b border-stone-200 flex-wrap gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className="font-medium text-stone-900 truncate">{group.displayName}</div>
+                    {isUnmatched && <span className="text-xs px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded whitespace-nowrap">niet in systeem</span>}
+                  </div>
+                  <div className="text-xs text-stone-500 whitespace-nowrap">{fmtHours(secsToHours(totalSecs))} uur · {group.entries.length} regel(s)</div>
+                </div>
+                <div className="divide-y divide-stone-100">
+                  {group.entries.map(e => (
+                    <TimeEntryRow key={e.id} entry={e} projects={projects} onUpdate={onUpdate} onRemove={onRemove} />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          {filteredGroups.length === 0 && search && (
+            <Empty>Geen agents gevonden voor "{search}".</Empty>
+          )}
+        </div>
+      );
+    }
+
+    function TimeEntryRow({ entry, projects, onUpdate, onRemove }) {
+      const [open, setOpen] = useState(false);
+      const totalSecs = entryTotalSecs(entry);
+
+      return (
+        <div>
+          <button onClick={() => setOpen(o => !o)} className="w-full flex items-center justify-between p-3 hover:bg-stone-50 text-left gap-3">
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              {open ? <ChevronUp size={14} className="text-stone-400 flex-shrink-0" /> : <ChevronDown size={14} className="text-stone-400 flex-shrink-0" />}
+              <div className="truncate text-sm text-stone-700">
+                {entry.projectName || <em className="text-stone-400">geen project</em>}
+              </div>
+            </div>
+            <div className="flex items-center gap-3 whitespace-nowrap">
+              {entry.sales > 0 && (
+                <div className="text-xs text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded">{entry.sales} sales</div>
+              )}
+              <div className="text-sm text-stone-600 tabular-nums">{fmtHours(secsToHours(totalSecs))} uur</div>
+            </div>
+          </button>
+          {open && (
+            <div className="p-3 bg-stone-50/50 border-t border-stone-100">
+              <div className="grid grid-cols-1 md:grid-cols-[1fr_120px] gap-3 mb-3">
+                <div>
+                  <Label>Project</Label>
+                  <ProjectSelect value={entry.projectName || ''} projects={projects}
+                    onChange={(v) => onUpdate(entry.id, 'projectName', v)} />
+                </div>
+                <div>
+                  <Label>Sales</Label>
+                  <Input type="number" value={entry.sales || ''}
+                    onChange={(e) => onUpdate(entry.id, 'sales', parseFloat(e.target.value) || 0)}
+                    placeholder="0" />
+                </div>
+              </div>
+              <Label>Uren (HH:MM, HH:MM:SS of decimaal)</Label>
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mb-3 mt-1.5">
+                {TIME_FIELDS.map(([k, label]) => (
+                  <div key={k}>
+                    <div className="text-xs text-stone-500 mb-1">{label}</div>
+                    <TimeInput value={entry[k] || 0} onChange={(v) => onUpdate(entry.id, k, v)} />
+                  </div>
+                ))}
+              </div>
+              <div className="flex justify-end">
+                <button onClick={() => onRemove(entry.id)} className="text-sm text-rose-600 hover:text-rose-800 flex items-center gap-1">
+                  <Trash2 size={13} /> Regel verwijderen
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ------------------------- Payslips Tab ------------------------- */
+    function PayslipsTab({ agents, computeAgentPayroll, generatePDF, generateAllPDFs, generatePayoutSheet, jsPdfLoaded, generating, currentMonth }) {
+      const [search, setSearch] = useState('');
+      const totals = useMemo(() => agents.map(a => ({ agent: a, calc: computeAgentPayroll(a) })), [agents, computeAgentPayroll]);
+      const grandTotal = totals.reduce((s, t) => s + t.calc.totalGross, 0);
+      const filteredTotals = useMemo(
+        () => totals.filter(t => agentMatchesSearch(t.agent, search)),
+        [totals, search]
+      );
+
+      return (
+        <div className="space-y-6">
+          <div className="flex items-baseline justify-between flex-wrap gap-3">
+            <div>
+              <div style={displayFont} className="text-3xl text-stone-900">Loonstroken</div>
+              <div className="text-sm text-stone-500 mt-1">{fmtMonth(currentMonth)} · totaal {fmtEuro(grandTotal)}</div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={generatePayoutSheet} disabled={agents.length === 0}
+                className="px-4 py-2 bg-stone-800 text-white rounded hover:bg-stone-700 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-50">
+                <Download size={14} /> Uitbetaallijst (Excel)
+              </button>
+              <button onClick={generateAllPDFs} disabled={!jsPdfLoaded || generating || agents.length === 0}
+                className="px-4 py-2 bg-emerald-900 text-white rounded hover:bg-emerald-800 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-50">
+                <Download size={14} /> {generating ? 'ZIP wordt gemaakt…' : 'Alle PDFs (ZIP)'}
+              </button>
+            </div>
+          </div>
+
+          {agents.length === 0 ? (
+            <Card><Empty>Voeg eerst medewerkers toe in Instellingen.</Empty></Card>
+          ) : (
+            <>
+              {agents.length > 5 && (
+                <div>
+                  <SearchBar value={search} onChange={setSearch} placeholder="Zoek medewerker op naam of bijnaam..." />
+                  {search && (
+                    <div className="text-xs text-stone-500 mt-1.5">{filteredTotals.length} van {agents.length} getoond</div>
+                  )}
+                </div>
+              )}
+              {filteredTotals.length === 0 ? (
+                <Card><Empty>Geen medewerkers gevonden voor "{search}".</Empty></Card>
+              ) : (
+                <div className="space-y-4">
+                  {filteredTotals.map(({ agent, calc }) => (
+                    <PayslipCard key={agent.id} agent={agent} calc={calc} onDownload={() => generatePDF(agent)} jsPdfLoaded={jsPdfLoaded} />
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      );
+    }
+
+    function PayslipCard({ agent, calc, onDownload, jsPdfLoaded }) {
+      return (
+        <div className="bg-white border border-stone-200 rounded-lg overflow-hidden">
+          <div className="flex items-center justify-between p-4 border-b border-stone-100 flex-wrap gap-3">
+            <div>
+              <div className="font-semibold text-stone-900">{agent.name || <span className="text-stone-400">Naamloos</span>}</div>
+              <div className="text-xs text-stone-500 mt-0.5">{fmtEuro(calc.wage)}/uur</div>
+            </div>
+            <div className="flex items-center gap-4">
+              <div className="text-right">
+                <div className="text-xs text-stone-500 uppercase tracking-wider">Bruto</div>
+                <div style={displayFont} className="text-2xl text-emerald-900">{fmtEuro(calc.totalGross)}</div>
+              </div>
+              <button onClick={onDownload} disabled={!jsPdfLoaded}
+                className="px-3 py-2 bg-stone-900 text-white rounded hover:bg-stone-800 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-50">
+                <Download size={14} /> PDF
+              </button>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 p-4 text-sm">
+            {calc.projectGroups.map(g => (
+              <PayslipRow key={g.projectName} label={`Werkuren ${g.projectName} (${fmtHours(secsToHours(g.totalSecs))} uur)`} value={fmtEuro(secsToHours(g.totalSecs) * calc.wage)} />
+            ))}
+            {calc.projectGroups.length > 1 && (
+              <PayslipRow label={`Totaal werkuren (${fmtHours(calc.workHours)} uur)`} value={fmtEuro(calc.workPay)} bold />
+            )}
+            {calc.totalHolidayHours > 0 && <PayslipRow label={`Feestdagen (${fmtHours(calc.totalHolidayHours)} uur)`} value={fmtEuro(calc.holidayPay)} />}
+            {calc.incentiveHours > 0 && <PayslipRow label={`Incentive uren (${fmtHours(calc.incentiveHours)} uur)`} value={fmtEuro(calc.incentivePay)} />}
+            {calc.outageHours > 0 && <PayslipRow label={`Systeemstoringen (${fmtHours(calc.outageHours)} uur)`} value={fmtEuro(calc.outagePay)} />}
+            {calc.toiletHours > 0 && <PayslipRow label={`Toiletvergoeding (${fmtHours(calc.toiletHours)} uur)`} value={fmtEuro(calc.toiletPay)} />}
+            {calc.fixedAllowances.map(al => (
+              <PayslipRow key={al.id} label={al.description || 'Vaste vergoeding'} value={fmtEuro(Number(al.amount) || 0)} />
+            ))}
+            {calc.projectBonuses.map(pb => (
+              <PayslipRow key={pb.projectId} label={`Bonus ${pb.projectName} (${pb.sales} sales)`} value={fmtEuro(pb.bonus)} />
+            ))}
+            {calc.hourBonus > 0 && (
+              <PayslipRow label={`Uren-bonus (${fmtHours(calc.qualifyingHours)} uur, vanaf ${calc.hourBonusTier?.minHours || 0})`} value={fmtEuro(calc.hourBonus)} />
+            )}
+            {calc.manualBonuses.map(b => (
+              <PayslipRow key={b.id} label={`${b.description || 'Bonus'}${b.sales ? ` (${b.sales} sales)` : ''}`} value={fmtEuro(Number(b.amount) || 0)} />
+            ))}
+          </div>
+        </div>
+      );
+    }
+    function PayslipRow({ label, value, bold }) {
+      return (
+        <div className="flex justify-between py-1 border-b border-stone-50">
+          <span className={bold ? 'text-stone-900 font-semibold' : 'text-stone-600'}>{label}</span>
+          <span className={`tabular-nums ${bold ? 'text-stone-900 font-semibold' : 'text-stone-900 font-medium'}`}>{value}</span>
+        </div>
+      );
+    }
+
+    /* ------------------------- Reusable bits ------------------------- */
+    function Card({ icon, title, action, children }) {
+      return (
+        <section className="bg-white border border-stone-200 rounded-lg p-6">
+          {(title || action) && (
+            <header className="flex items-center justify-between mb-5 flex-wrap gap-3">
+              <div className="flex items-center gap-2 text-stone-700">
+                {icon}<h2 className="font-semibold text-stone-900">{title}</h2>
+              </div>
+              {action}
+            </header>
+          )}
+          {children}
+        </section>
+      );
+    }
+    function Label({ children }) {
+      return <div className="text-xs text-stone-500 uppercase tracking-wider font-medium mb-1.5">{children}</div>;
+    }
+    function NumberInput({ value, onChange, className, onFocus, ...rest }) {
+      const [str, setStr] = useState('');
+      const [focused, setFocused] = useState(false);
+
+      useEffect(() => {
+        if (!focused) {
+          const num = Number(value);
+          if (!num || isNaN(num)) setStr('');
+          else setStr(String(num).replace('.', ','));
+        }
+      }, [value, focused]);
+
+      const handleChange = (e) => {
+        const v = e.target.value;
+        if (v !== '' && !/^-?[0-9]*[.,]?[0-9]*$/.test(v)) return;
+        setStr(v);
+        const cleaned = v.replace(',', '.');
+        if (cleaned === '' || cleaned === '.' || cleaned === '-' || cleaned === '-.') {
+          onChange?.({ target: { value: '0' } });
+          return;
+        }
+        const num = parseFloat(cleaned);
+        if (!isNaN(num)) onChange?.({ target: { value: String(num) } });
+      };
+
+      const handleFocus = (e) => {
+        setFocused(true);
+        e.target.select();
+        if (onFocus) onFocus(e);
+      };
+
+      return (
+        <input
+          type="text" inputMode="decimal"
+          value={str}
+          onChange={handleChange}
+          onFocus={handleFocus}
+          onBlur={() => setFocused(false)}
+          className={className}
+          {...rest}
+        />
+      );
+    }
+
+    function Input({ className = '', onFocus, ...props }) {
+      const baseClass = `w-full px-3 py-2 text-sm border border-stone-200 rounded bg-white text-stone-900 outline-none focus:border-emerald-700 focus:ring-1 focus:ring-emerald-700/20 ${className}`;
+      if (props.type === 'number') {
+        const { type, step, ...rest } = props;
+        return <NumberInput {...rest} onFocus={onFocus} className={baseClass} />;
+      }
+      return <input {...props} onFocus={onFocus} className={baseClass} />;
+    }
+
+    function TimeInput({ value, onChange, className = '', onFocus, ...rest }) {
+      const [str, setStr] = useState('');
+      const [focused, setFocused] = useState(false);
+
+      useEffect(() => {
+        if (!focused) setStr(formatSecs(value));
+      }, [value, focused]);
+
+      const handleChange = (e) => {
+        const v = e.target.value;
+        setStr(v);
+        if (v.trim() === '') { onChange(0); return; }
+        const secs = parseTime(v);
+        onChange(secs);
+      };
+
+      const handleFocus = (e) => {
+        setFocused(true);
+        e.target.select();
+        if (onFocus) onFocus(e);
+      };
+
+      const handleBlur = () => {
+        setFocused(false);
+        onChange(parseTime(str) || 0);
+      };
+
+      return (
+        <input
+          type="text"
+          value={str}
+          onChange={handleChange}
+          onFocus={handleFocus}
+          onBlur={handleBlur}
+          placeholder="0:00:00"
+          className={`w-full px-3 py-2 text-sm border border-stone-200 rounded bg-white text-stone-900 outline-none focus:border-emerald-700 focus:ring-1 focus:ring-emerald-700/20 ${className}`}
+          {...rest}
+        />
+      );
+    }
+
+    function ProjectSelect({ value, onChange, projects, className = '', includeNoProject = true }) {
+      const projectNames = projects.filter(p => p.name && p.name.trim()).map(p => p.name.trim());
+      const isCustom = value && !projectNames.includes(value);
+      return (
+        <select value={value || ''} onChange={(e) => onChange(e.target.value)}
+          className={`w-full px-3 py-2 text-sm border border-stone-200 rounded bg-white text-stone-900 outline-none focus:border-emerald-700 focus:ring-1 focus:ring-emerald-700/20 ${className}`}>
+          {includeNoProject && <option value="">— Geen project —</option>}
+          {projectNames.map(n => <option key={n} value={n}>{n}</option>)}
+          {isCustom && <option value={value}>{value} (overig)</option>}
+        </select>
+      );
+    }
+    function BtnPrimary({ onClick, children }) {
+      return (
+        <button onClick={onClick} className="px-3 py-1.5 bg-emerald-900 text-white rounded hover:bg-emerald-800 inline-flex items-center gap-1.5 text-sm font-medium">
+          {children}
+        </button>
+      );
+    }
+    function Empty({ children }) {
+      return <div className="text-center py-6 text-sm text-stone-500">{children}</div>;
+    }
+
+    function SearchBar({ value, onChange, placeholder = 'Zoeken...', className = '' }) {
+      return (
+        <div className={`relative ${className}`}>
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 pointer-events-none" />
+          <input
+            type="search"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={placeholder}
+            className="w-full pl-9 pr-3 py-2 text-sm border border-stone-200 rounded bg-white text-stone-900 outline-none focus:border-emerald-700 focus:ring-1 focus:ring-emerald-700/20"
+          />
+          {value && (
+            <button onClick={() => onChange('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-700">
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    function matchesSearch(text, query) {
+      if (!query) return true;
+      return String(text || '').toLowerCase().includes(query.toLowerCase());
+    }
+
+    function agentMatchesSearch(agent, query) {
+      if (!query) return true;
+      const q = query.toLowerCase();
+      return (agent.name || '').toLowerCase().includes(q)
+        || (agent.nickname || '').toLowerCase().includes(q);
+    }
+
+    /* ------------------------- Styles ------------------------- */
+    const baseStyle = { fontFamily: "'Manrope', system-ui, sans-serif" };
+    const displayFont = { fontFamily: "'Fraunces', Georgia, serif", fontWeight: 500, fontVariationSettings: "'opsz' 144" };
+
+    const globalCss = `
+      input[type="number"] { -moz-appearance: textfield; }
+      input[type="number"]::-webkit-outer-spin-button,
+      input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+      .tabular-nums { font-variant-numeric: tabular-nums; }
+    `;
+
+
+    /* === Render === */
+    ReactDOM.createRoot(document.getElementById('root')).render(<PayrollDashboard />);
+  </script>
+</body>
+</html>
