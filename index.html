@@ -203,8 +203,16 @@
     }
     function eligiblePotsFor(agent) {
       const method = agent.payoutMethod || 'rekening';
-      const currency = agent.accountCurrency || 'EUR';
-      return POT_KEYS.filter(k => POT_META[k].method === method && POT_META[k].currency === currency);
+      return POT_KEYS.filter(k => POT_META[k].method === method);
+    }
+    function potDebit(eurAmount, potKey, exchangeRate) {
+      // EUR pots: debit is the EUR amount itself.
+      // SRD pots: debit is eurAmount * exchangeRate (in SRD).
+      if (POT_META[potKey]?.currency === 'SRD') {
+        const r = Number(exchangeRate) || 0;
+        return eurAmount * r;
+      }
+      return eurAmount;
     }
     function prevMonth(ym) {
       if (!ym) return ym;
@@ -433,11 +441,12 @@
                 const prevParsed = JSON.parse(prevR.value);
                 const pp = prevParsed.payoutData;
                 if (pp && pp.funds) {
-                  // Remaining = startFunds - paidOut per pot
+                  // Remaining = startFunds - paidOut per pot (in pot's own currency)
                   const paidByPot = POT_KEYS.reduce((o, k) => { o[k] = 0; return o; }, {});
                   Object.values(pp.payouts || {}).forEach(p => {
                     if (p && p.paid && p.paidBy && paidByPot[p.paidBy] !== undefined) {
-                      paidByPot[p.paidBy] += Number(p.amount) || 0;
+                      const eur = Number(p.amount) || 0;
+                      paidByPot[p.paidBy] += potDebit(eur, p.paidBy, p.exchangeRate);
                     }
                   });
                   const remaining = POT_KEYS.reduce((o, k) => {
@@ -635,27 +644,26 @@
       }
       function autoAssignPayouts(agents, computeAgentPayroll) {
         const today = new Date().toISOString().slice(0, 10);
-        // Build wage list per agent
+        // All wages are in EUR; SRD pots only apply when an exchange rate is set later.
         const wages = agents.map(a => {
           const calc = computeAgentPayroll(a);
-          const currency = a.accountCurrency || 'EUR';
           const method = a.payoutMethod || 'rekening';
-          return { agent: a, amount: calc.totalGross, currency, method };
+          return { agent: a, amount: calc.totalGross, method };
         }).filter(w => w.amount > 0);
 
-        // Sort: cash agents first (so cash pot gets used up before bank pots)
+        // Cash agents first (drain cash pots) and larger amounts first within group.
         wages.sort((x, y) => {
           if (x.method !== y.method) return x.method === 'cash' ? -1 : 1;
-          return y.amount - x.amount; // larger amounts first within group
+          return y.amount - x.amount;
         });
 
         const remaining = { ...payoutData.funds };
         const newPayouts = { ...payoutData.payouts };
 
         wages.forEach(w => {
-          const eligible = eligiblePotsFor(w.agent);
+          // Prefer EUR pots since wages are EUR; only consider EUR for auto-assign.
+          const eligible = eligiblePotsFor(w.agent).filter(k => POT_META[k].currency === 'EUR');
           if (eligible.length === 0) return;
-          // Strategy: pick the first eligible pot that still has enough; if none has enough, pick the one with most.
           let pick = eligible.find(k => remaining[k] >= w.amount);
           if (!pick) pick = eligible.slice().sort((a, b) => remaining[b] - remaining[a])[0];
           remaining[pick] = (remaining[pick] || 0) - w.amount;
@@ -2178,9 +2186,15 @@
     }
 
     function PayoutsTab({ agents, computeAgentPayroll, payoutData, updateFund, updatePayoutField, autoAssignPayouts, clearPayoutAssignments, currentMonth }) {
-      const today = new Date().toISOString().slice(0, 10);
       const funds = payoutData.funds || emptyFunds();
       const payouts = payoutData.payouts || {};
+
+      const [sortBy, setSortBy] = useState('name');
+      const [sortDir, setSortDir] = useState('asc');
+      function toggleSort(col) {
+        if (sortBy === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+        else { setSortBy(col); setSortDir('asc'); }
+      }
 
       const wages = useMemo(() => {
         return agents.map(a => {
@@ -2188,25 +2202,21 @@
           return {
             agent: a,
             amount: calc.totalGross,
-            currency: a.accountCurrency || 'EUR',
             method: a.payoutMethod || 'rekening',
+            accountCurrency: a.accountCurrency || 'EUR',
             eligible: eligiblePotsFor(a),
           };
         }).filter(w => w.amount > 0);
       }, [agents, computeAgentPayroll]);
 
-      const totalsByCurrency = useMemo(() => {
-        const t = { EUR: 0, SRD: 0 };
-        wages.forEach(w => { t[w.currency] = (t[w.currency] || 0) + w.amount; });
-        return t;
-      }, [wages]);
+      const totalEurWages = useMemo(() => wages.reduce((s, w) => s + w.amount, 0), [wages]);
 
       const usedByPot = useMemo(() => {
         const u = POT_KEYS.reduce((o, k) => { o[k] = 0; return o; }, {});
         wages.forEach(w => {
           const p = payouts[w.agent.id];
           if (p && p.paidBy && u[p.paidBy] !== undefined) {
-            u[p.paidBy] += w.amount;
+            u[p.paidBy] += potDebit(w.amount, p.paidBy, p.exchangeRate);
           }
         });
         return u;
@@ -2216,6 +2226,9 @@
 
       const totalAvailableEur = (funds.shenifaCashEur || 0) + (funds.shenifaBankEur || 0) + (funds.anouskaBankEur || 0);
       const totalAvailableSrd = (funds.shenifaCashSrd || 0) + (funds.shenifaBankSrd || 0);
+      const totalShenifaEur = (funds.shenifaCashEur || 0) + (funds.shenifaBankEur || 0);
+      const totalAnouskaEur = (funds.anouskaBankEur || 0);
+      const totalShenifaSrd = (funds.shenifaCashSrd || 0) + (funds.shenifaBankSrd || 0);
       const totalRemainingEur = remaining.shenifaCashEur + remaining.shenifaBankEur + remaining.anouskaBankEur;
       const totalRemainingSrd = remaining.shenifaCashSrd + remaining.shenifaBankSrd;
 
@@ -2225,6 +2238,45 @@
 
       const eurPots = ['shenifaCashEur', 'shenifaBankEur', 'anouskaBankEur'];
       const srdPots = ['shenifaCashSrd', 'shenifaBankSrd'];
+
+      const sortedWages = useMemo(() => {
+        const arr = wages.slice();
+        const dir = sortDir === 'asc' ? 1 : -1;
+        arr.sort((a, b) => {
+          let av, bv;
+          if (sortBy === 'name') {
+            av = (a.agent.name || a.agent.nickname || '').toLowerCase();
+            bv = (b.agent.name || b.agent.nickname || '').toLowerCase();
+            return av < bv ? -1 * dir : av > bv ? 1 * dir : 0;
+          }
+          if (sortBy === 'amount') {
+            return (a.amount - b.amount) * dir;
+          }
+          if (sortBy === 'paidBy') {
+            av = POT_LABELS[payouts[a.agent.id]?.paidBy] || '';
+            bv = POT_LABELS[payouts[b.agent.id]?.paidBy] || '';
+            return av < bv ? -1 * dir : av > bv ? 1 * dir : 0;
+          }
+          if (sortBy === 'paid') {
+            av = payouts[a.agent.id]?.paid ? 1 : 0;
+            bv = payouts[b.agent.id]?.paid ? 1 : 0;
+            return (av - bv) * dir;
+          }
+          return 0;
+        });
+        return arr;
+      }, [wages, sortBy, sortDir, payouts]);
+
+      function SortHeader({ col, children, align = 'left' }) {
+        const active = sortBy === col;
+        const arrow = active ? (sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+        return (
+          <th className={`text-${align} py-2 px-2 cursor-pointer select-none hover:text-stone-700 ${active ? 'text-emerald-800' : ''}`}
+            onClick={() => toggleSort(col)}>
+            {children}{arrow}
+          </th>
+        );
+      }
 
       return (
         <div className="space-y-6">
@@ -2247,7 +2299,32 @@
 
           {/* Beschikbaar */}
           <Card icon={<Wallet size={18} />} title="Beschikbaar geld deze maand">
-            <div className="text-xs text-stone-500 mb-3">Vul in hoeveel geld er aan het begin van deze maand bij elke persoon ligt. Het overschot van vorige maand wordt automatisch overgenomen.</div>
+            <div className="text-xs text-stone-500 mb-4">Vul in hoeveel geld er aan het begin van deze maand bij elke persoon ligt. Het overschot van vorige maand wordt automatisch overgenomen.</div>
+
+            {/* Totalen bovenin */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+              <div className="p-3 rounded bg-emerald-50 border border-emerald-200">
+                <div className="text-[10px] text-emerald-900 font-medium uppercase tracking-wider">Totaal beschikbaar (€)</div>
+                <div className="text-xl font-semibold tabular-nums text-emerald-900 mt-0.5">{fmtEuro(totalAvailableEur)}</div>
+                <div className="text-[10px] text-emerald-700 mt-1">Lonen: {fmtEuro(totalEurWages)}</div>
+              </div>
+              <div className="p-3 rounded bg-stone-50 border border-stone-200">
+                <div className="text-[10px] text-stone-500 font-medium uppercase tracking-wider">Shenifa totaal (€)</div>
+                <div className="text-xl font-semibold tabular-nums text-stone-900 mt-0.5">{fmtEuro(totalShenifaEur)}</div>
+                <div className="text-[10px] text-stone-500 mt-1">cash + rekening</div>
+              </div>
+              <div className="p-3 rounded bg-stone-50 border border-stone-200">
+                <div className="text-[10px] text-stone-500 font-medium uppercase tracking-wider">Anouska totaal (€)</div>
+                <div className="text-xl font-semibold tabular-nums text-stone-900 mt-0.5">{fmtEuro(totalAnouskaEur)}</div>
+                <div className="text-[10px] text-stone-500 mt-1">rekening</div>
+              </div>
+              <div className="p-3 rounded bg-stone-50 border border-stone-200">
+                <div className="text-[10px] text-stone-500 font-medium uppercase tracking-wider">Shenifa SRD</div>
+                <div className="text-xl font-semibold tabular-nums text-stone-900 mt-0.5">{fmtSrd(totalShenifaSrd)}</div>
+                <div className="text-[10px] text-stone-500 mt-1">cash + rekening</div>
+              </div>
+            </div>
+
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-2">
               {eurPots.map(k => (
                 <div key={k}>
@@ -2286,28 +2363,31 @@
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-[10px] text-stone-500 uppercase tracking-wider font-medium border-b border-stone-200">
-                      <th className="text-left py-2 px-2">Medewerker</th>
-                      <th className="text-right py-2 px-2">Bedrag</th>
+                      <SortHeader col="name">Medewerker</SortHeader>
+                      <SortHeader col="amount" align="right">Bedrag (€)</SortHeader>
                       <th className="text-left py-2 px-2">Methode</th>
-                      <th className="text-left py-2 px-2">Uitbetaald door</th>
+                      <SortHeader col="paidBy">Uitbetaald door</SortHeader>
                       <th className="text-left py-2 px-2">Datum</th>
-                      <th className="text-center py-2 px-2">Voldaan</th>
+                      <SortHeader col="paid" align="center">Voldaan</SortHeader>
                     </tr>
                   </thead>
                   <tbody>
-                    {wages.map(w => {
+                    {sortedWages.map(w => {
                       const p = payouts[w.agent.id] || {};
-                      const display = (w.agent.nickname || w.agent.name || 'Medewerker').trim();
+                      const isSrdPot = p.paidBy && POT_META[p.paidBy]?.currency === 'SRD';
+                      const rate = Number(p.exchangeRate) || 0;
+                      const srdAmount = isSrdPot ? w.amount * rate : 0;
                       return (
                         <tr key={w.agent.id} className="border-b border-stone-100 align-middle">
                           <td className="py-2 px-2">
                             <div className="font-medium text-stone-900">{w.agent.name || <span className="text-stone-400">Naamloos</span>}</div>
                             {w.agent.nickname && <div className="text-xs text-stone-500">{w.agent.nickname}</div>}
                           </td>
-                          <td className="py-2 px-2 text-right tabular-nums font-medium">{fmtMoney(w.amount, w.currency)}</td>
+                          <td className="py-2 px-2 text-right tabular-nums font-medium">{fmtEuro(w.amount)}</td>
                           <td className="py-2 px-2 text-stone-600">
                             <span className="inline-flex items-center gap-1 text-xs">
-                              {w.method === 'cash' ? 'Cash' : 'Rekening'} · {w.currency}
+                              {w.method === 'cash' ? 'Cash' : 'Rekening'}
+                              {w.accountCurrency === 'SRD' && <span className="px-1 py-0.5 bg-amber-100 text-amber-800 text-[9px] rounded font-medium">SRD-rek.</span>}
                             </span>
                           </td>
                           <td className="py-2 px-2">
@@ -2317,8 +2397,21 @@
                               <option value="">— kies —</option>
                               {w.eligible.map(k => <option key={k} value={k}>{POT_LABELS[k]}</option>)}
                             </select>
+                            {isSrdPot && (
+                              <div className="mt-1.5 flex items-center gap-1.5">
+                                <span className="text-[10px] text-stone-500 whitespace-nowrap">Koers €1 =</span>
+                                <input type="number" step="0.01" value={p.exchangeRate || ''}
+                                  onChange={(e) => updatePayoutField(w.agent.id, 'exchangeRate', parseFloat(e.target.value) || 0)}
+                                  placeholder="bv. 38"
+                                  className="w-20 px-2 py-1 text-xs border border-amber-300 rounded bg-amber-50 outline-none focus:border-amber-600" />
+                                <span className="text-[10px] text-stone-500">SRD</span>
+                                {rate > 0 && (
+                                  <span className="text-[11px] text-emerald-800 font-medium ml-1">= {fmtSrd(srdAmount)}</span>
+                                )}
+                              </div>
+                            )}
                             {w.eligible.length === 0 && (
-                              <div className="text-xs text-rose-600 mt-1">Geen geschikte pot voor {w.method}/{w.currency}</div>
+                              <div className="text-xs text-rose-600 mt-1">Geen geschikte pot voor methode "{w.method}"</div>
                             )}
                           </td>
                           <td className="py-2 px-2">
@@ -2338,10 +2431,7 @@
                   <tfoot>
                     <tr className="font-semibold text-stone-900">
                       <td className="py-2 px-2">Totaal lonen</td>
-                      <td className="py-2 px-2 text-right tabular-nums">
-                        {totalsByCurrency.EUR > 0 && <div>{fmtEuro(totalsByCurrency.EUR)}</div>}
-                        {totalsByCurrency.SRD > 0 && <div>{fmtSrd(totalsByCurrency.SRD)}</div>}
-                      </td>
+                      <td className="py-2 px-2 text-right tabular-nums">{fmtEuro(totalEurWages)}</td>
                       <td colSpan="4"></td>
                     </tr>
                   </tfoot>
