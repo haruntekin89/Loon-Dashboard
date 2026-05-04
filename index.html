@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Loondashboard</title>
+  <title>Loondashboard — Cloud</title>
 
   <!-- React + Babel + Tailwind via CDN -->
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
@@ -16,6 +16,9 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+  <!-- Supabase -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
   <!-- Fonts -->
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -33,62 +36,69 @@
   <div id="root"><div id="loading">Bezig met laden…</div></div>
 
   <script>
-    // ----- localStorage shim that mimics Claude's window.storage API -----
+    /* ============================================================
+       VUL HIER JE SUPABASE GEGEVENS IN
+       Zie de stap-voor-stap setup-handleiding.
+       ============================================================ */
+    const SUPABASE_URL = 'https://oowhghtpephxawkakpdn.supabase.co/rest/v1/';
+    const SUPABASE_ANON_KEY = 'YOUR-ANON-KEY-HEREsb_publishable_UlDkrwA501qeSyb_jC1uQg_JIXjdWia';
+    /* ============================================================ */
+
+    const isConfigured = SUPABASE_URL.startsWith('https://') &&
+                         !SUPABASE_URL.includes('YOUR-PROJECT') &&
+                         SUPABASE_ANON_KEY.length > 30 &&
+                         !SUPABASE_ANON_KEY.includes('YOUR-ANON');
+
+    let sb = null;
+    if (isConfigured) {
+      sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    }
+
+    // Storage API backed by Supabase (replaces localStorage)
     window.storage = {
       async get(key) {
-        const v = localStorage.getItem(key);
-        if (v === null) return null;
-        return { key, value: v, shared: false };
+        if (!sb) return null;
+        const { data, error } = await sb.from('payroll_data').select('value').eq('key', key).maybeSingle();
+        if (error) { console.error('storage.get', error); return null; }
+        if (!data) return null;
+        return { key, value: data.value, shared: true };
       },
       async set(key, value) {
-        localStorage.setItem(key, value);
-        return { key, value, shared: false };
+        if (!sb) throw new Error('Supabase niet geconfigureerd');
+        const { error } = await sb.from('payroll_data').upsert({ key, value, updated_at: new Date().toISOString() });
+        if (error) throw error;
+        return { key, value, shared: true };
       },
       async delete(key) {
-        const existed = localStorage.getItem(key) !== null;
-        localStorage.removeItem(key);
-        return { key, deleted: existed, shared: false };
+        if (!sb) throw new Error('Supabase niet geconfigureerd');
+        const { error } = await sb.from('payroll_data').delete().eq('key', key);
+        if (error) throw error;
+        return { key, deleted: true, shared: true };
       },
       async list(prefix = '') {
-        const keys = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          if (k && k.startsWith(prefix)) keys.push(k);
-        }
-        return { keys, prefix, shared: false };
+        if (!sb) return { keys: [], prefix, shared: true };
+        const { data, error } = await sb.from('payroll_data').select('key').like('key', prefix + '%');
+        if (error) { console.error('storage.list', error); return { keys: [], prefix, shared: true }; }
+        return { keys: data.map(r => r.key), prefix, shared: true };
       }
     };
 
-    // Export / import all data
-    window.exportPayrollData = function () {
-      const data = {};
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && (k === 'setup' || k.startsWith('month:'))) data[k] = localStorage.getItem(k);
+    // Backup helpers
+    window.exportPayrollData = async function () {
+      try {
+        const { data, error } = await sb.from('payroll_data').select('*');
+        if (error) throw error;
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const date = new Date().toISOString().slice(0, 10);
+        a.download = `loondashboard-backup-${date}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        alert('Backup mislukt: ' + e.message);
       }
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      const date = new Date().toISOString().slice(0, 10);
-      a.download = `loondashboard-backup-${date}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-    };
-
-    window.importPayrollData = function (file) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          try {
-            const data = JSON.parse(reader.result);
-            for (const [k, v] of Object.entries(data)) localStorage.setItem(k, v);
-            resolve(Object.keys(data).length);
-          } catch (e) { reject(e); }
-        };
-        reader.onerror = () => reject(reader.error);
-        reader.readAsText(file);
-      });
     };
   </script>
 
@@ -128,8 +138,10 @@
     const ChevronDown = makeIcon([P('m6 9 6 6 6-6')]);
     const ChevronUp = makeIcon([P('m18 15-6-6-6 6')]);
     const Clock = makeIcon([C(12, 12, 10), PL('12 6 12 12 16 14')]);
-    const Search = makeIcon([C(11, 11, 8), L(21, 21, 16.65, 16.65)]);
     const Database = makeIcon([({ t: 'ellipse', a: { cx: 12, cy: 5, rx: 9, ry: 3 } }), P('M3 5v14a9 3 0 0 0 18 0V5'), P('M3 12a9 3 0 0 0 18 0')]);
+    const Search = makeIcon([C(11, 11, 8), L(21, 21, 16.65, 16.65)]);
+    const LogOut = makeIcon([P('M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4'), PL('16 17 21 12 16 7'), L(21, 12, 9, 12)]);
+    const Cloud = makeIcon([P('M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z')]);
 
     /* === APP CODE BELOW (auto-generated from React source) === */
 
@@ -2185,8 +2197,142 @@
     `;
 
 
+    /* ============================================================
+       AUTH WRAPPER
+       ============================================================ */
+    function ConfigErrorScreen() {
+      return (
+        <div style={{ fontFamily: "'Manrope', system-ui, sans-serif" }} className="min-h-screen bg-stone-100 flex items-center justify-center p-6">
+          <div className="bg-white border border-stone-200 rounded-lg p-8 max-w-lg">
+            <div className="flex items-center gap-2 mb-3 text-rose-600">
+              <AlertCircle size={20} />
+              <h1 className="text-xl font-semibold">Supabase niet geconfigureerd</h1>
+            </div>
+            <p className="text-sm text-stone-700 mb-3">
+              Je moet eerst Supabase opzetten en de gegevens invullen in dit HTML-bestand. Open het bestand in een teksteditor en zoek bovenaan naar:
+            </p>
+            <pre className="bg-stone-100 p-3 rounded text-xs overflow-x-auto mb-3">
+{`const SUPABASE_URL = 'https://YOUR-PROJECT-ID.supabase.co';
+const SUPABASE_ANON_KEY = 'YOUR-ANON-KEY-HERE';`}
+            </pre>
+            <p className="text-sm text-stone-700">Vul daar je eigen Supabase URL en anon key in. Volg de setup-handleiding voor de stappen.</p>
+          </div>
+        </div>
+      );
+    }
+
+    function LoginScreen({ onLoggedIn }) {
+      const [email, setEmail] = useState('');
+      const [password, setPassword] = useState('');
+      const [err, setErr] = useState('');
+      const [busy, setBusy] = useState(false);
+
+      async function submit(e) {
+        e.preventDefault();
+        setErr(''); setBusy(true);
+        const { error } = await sb.auth.signInWithPassword({ email, password });
+        setBusy(false);
+        if (error) setErr(error.message);
+      }
+
+      return (
+        <div style={{ fontFamily: "'Manrope', system-ui, sans-serif" }} className="min-h-screen bg-stone-100 flex items-center justify-center p-6">
+          <form onSubmit={submit} className="bg-white border border-stone-200 rounded-lg p-8 max-w-sm w-full">
+            <div className="flex items-center gap-2 mb-1">
+              <div className="w-9 h-9 rounded bg-emerald-900 text-white flex items-center justify-center">
+                <Building2 size={18} />
+              </div>
+              <h1 style={{ fontFamily: "'Fraunces', Georgia, serif", fontWeight: 500 }} className="text-2xl text-stone-900">Loondashboard</h1>
+            </div>
+            <p className="text-xs text-stone-500 mb-6 ml-11">Cloud · log in om door te gaan</p>
+
+            <div className="mb-3">
+              <label className="text-xs text-stone-500 uppercase tracking-wider font-medium block mb-1.5">Email</label>
+              <input type="email" required value={email} onChange={e => setEmail(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-stone-200 rounded bg-white outline-none focus:border-emerald-700 focus:ring-1 focus:ring-emerald-700/20" />
+            </div>
+            <div className="mb-4">
+              <label className="text-xs text-stone-500 uppercase tracking-wider font-medium block mb-1.5">Wachtwoord</label>
+              <input type="password" required value={password} onChange={e => setPassword(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-stone-200 rounded bg-white outline-none focus:border-emerald-700 focus:ring-1 focus:ring-emerald-700/20" />
+            </div>
+
+            {err && <div className="mb-3 p-2 text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded">{err}</div>}
+
+            <button type="submit" disabled={busy}
+              className="w-full px-4 py-2 bg-emerald-900 text-white rounded hover:bg-emerald-800 text-sm font-medium disabled:opacity-50">
+              {busy ? 'Bezig…' : 'Inloggen'}
+            </button>
+
+            <p className="text-xs text-stone-500 mt-4 text-center">
+              Geen account? Vraag de beheerder om je toe te voegen via Supabase.
+            </p>
+          </form>
+        </div>
+      );
+    }
+
+    function CloudHeader({ user, onLogout }) {
+      const [open, setOpen] = useState(false);
+      return (
+        <div className="bg-emerald-900 text-emerald-50 text-xs">
+          <div className="max-w-6xl mx-auto px-6 py-1.5 flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <Cloud size={12} />
+              <span>Cloud · alle wijzigingen worden gedeeld</span>
+            </div>
+            <div className="relative">
+              <button onClick={() => setOpen(o => !o)} className="hover:text-white">
+                {user.email}
+              </button>
+              {open && (
+                <div className="absolute right-0 top-full mt-1 bg-white text-stone-800 rounded shadow-lg border border-stone-200 py-1 min-w-[180px] z-50">
+                  <button onClick={() => { setOpen(false); window.exportPayrollData(); }}
+                    className="w-full text-left px-3 py-1.5 text-sm hover:bg-stone-50 flex items-center gap-2">
+                    <Download size={13} /> Backup downloaden
+                  </button>
+                  <button onClick={() => { setOpen(false); onLogout(); }}
+                    className="w-full text-left px-3 py-1.5 text-sm hover:bg-stone-50 flex items-center gap-2 text-rose-700">
+                    <LogOut size={13} /> Uitloggen
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function CloudApp() {
+      const [user, setUser] = useState(null);
+      const [authLoading, setAuthLoading] = useState(true);
+
+      useEffect(() => {
+        if (!sb) { setAuthLoading(false); return; }
+        sb.auth.getSession().then(({ data }) => {
+          setUser(data.session?.user || null);
+          setAuthLoading(false);
+        });
+        const { data: { subscription } } = sb.auth.onAuthStateChange((_event, session) => {
+          setUser(session?.user || null);
+        });
+        return () => subscription?.unsubscribe();
+      }, []);
+
+      if (!isConfigured) return <ConfigErrorScreen />;
+      if (authLoading) return <div style={{ fontFamily: "'Manrope', system-ui, sans-serif" }} className="min-h-screen flex items-center justify-center bg-stone-100 text-stone-500">Bezig met laden…</div>;
+      if (!user) return <LoginScreen />;
+
+      return (
+        <>
+          <CloudHeader user={user} onLogout={() => sb.auth.signOut()} />
+          <PayrollDashboard />
+        </>
+      );
+    }
+
     /* === Render === */
-    ReactDOM.createRoot(document.getElementById('root')).render(<PayrollDashboard />);
+    ReactDOM.createRoot(document.getElementById('root')).render(<CloudApp />);
   </script>
 </body>
 </html>
