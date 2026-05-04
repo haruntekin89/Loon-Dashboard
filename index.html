@@ -142,6 +142,9 @@
     const Search = makeIcon([C(11, 11, 8), L(21, 21, 16.65, 16.65)]);
     const LogOut = makeIcon([P('M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4'), PL('16 17 21 12 16 7'), L(21, 12, 9, 12)]);
     const Cloud = makeIcon([P('M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z')]);
+    const Wallet = makeIcon([P('M21 12V7H5a2 2 0 0 1 0-4h14v4'), P('M3 5v14a2 2 0 0 0 2 2h16v-5'), P('M18 12a2 2 0 0 0 0 4h4v-4Z')]);
+    const AlertTriangle = makeIcon([P('m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z'), L(12, 9, 12, 13), L(12, 17, 12.01, 17)]);
+    const Wand = makeIcon([P('M15 4V2'), P('M15 16v-2'), P('M8 9h2'), P('M20 9h2'), P('M17.8 11.8 19 13'), P('M15 9h.01'), P('M17.8 6.2 19 5'), P('m3 21 9-9'), P('M12.2 6.2 11 5')]);
 
     /* === APP CODE BELOW (auto-generated from React source) === */
 
@@ -178,6 +181,39 @@
     }
 
     function secsToHours(secs) { return (secs || 0) / 3600; }
+
+    /* ---------- Payout pots ---------- */
+    const POT_KEYS = ['shenifaCashEur', 'shenifaBankEur', 'anouskaBankEur', 'shenifaCashSrd', 'shenifaBankSrd'];
+    const POT_LABELS = {
+      shenifaCashEur: 'Shenifa cash (€)',
+      shenifaBankEur: 'Shenifa rekening (€)',
+      anouskaBankEur: 'Anouska rekening (€)',
+      shenifaCashSrd: 'Shenifa cash (SRD)',
+      shenifaBankSrd: 'Shenifa rekening (SRD)',
+    };
+    const POT_META = {
+      shenifaCashEur: { holder: 'Shenifa', method: 'cash', currency: 'EUR' },
+      shenifaBankEur: { holder: 'Shenifa', method: 'rekening', currency: 'EUR' },
+      anouskaBankEur: { holder: 'Anouska', method: 'rekening', currency: 'EUR' },
+      shenifaCashSrd: { holder: 'Shenifa', method: 'cash', currency: 'SRD' },
+      shenifaBankSrd: { holder: 'Shenifa', method: 'rekening', currency: 'SRD' },
+    };
+    function emptyFunds() {
+      return POT_KEYS.reduce((o, k) => { o[k] = 0; return o; }, {});
+    }
+    function eligiblePotsFor(agent) {
+      const method = agent.payoutMethod || 'rekening';
+      const currency = agent.accountCurrency || 'EUR';
+      return POT_KEYS.filter(k => POT_META[k].method === method && POT_META[k].currency === currency);
+    }
+    function prevMonth(ym) {
+      if (!ym) return ym;
+      const [y, m] = ym.split('-').map(Number);
+      const d = new Date(y, m - 2, 1);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    }
+    function fmtSrd(n) { return 'SRD ' + (n || 0).toFixed(2).replace('.', ','); }
+    function fmtMoney(n, currency) { return currency === 'SRD' ? fmtSrd(n) : fmtEuro(n); }
 
     function fmtHours(h) {
       return (h || 0).toFixed(2).replace('.', ',');
@@ -290,6 +326,7 @@
       const [timeEntries, setTimeEntries] = useState([]);
       const [holidays, setHolidays] = useState([]);
       const [agentMonthData, setAgentMonthData] = useState({});
+      const [payoutData, setPayoutData] = useState({ funds: emptyFunds(), payouts: {} });
 
       const [jsPdfLoaded, setJsPdfLoaded] = useState(false);
       const [generating, setGenerating] = useState(false);
@@ -348,6 +385,7 @@
       useEffect(() => {
         if (loading) return;
         (async () => {
+          let savedPayout = null;
           try {
             const r = await window.storage.get(`month:${currentMonth}`);
             if (r) {
@@ -373,11 +411,49 @@
               }
               setHolidays(parsed.holidays || []);
               setAgentMonthData(parsed.agentMonthData || {});
+              savedPayout = parsed.payoutData || null;
             } else {
               setTimeEntries([]); setHolidays([]); setAgentMonthData({});
             }
           } catch (e) {
             setTimeEntries([]); setHolidays([]); setAgentMonthData({});
+          }
+
+          // Payout data: load saved if present, else carry over remaining funds from previous month
+          if (savedPayout && savedPayout.funds) {
+            setPayoutData({
+              funds: { ...emptyFunds(), ...(savedPayout.funds || {}) },
+              payouts: savedPayout.payouts || {},
+            });
+          } else {
+            try {
+              const prev = prevMonth(currentMonth);
+              const prevR = await window.storage.get(`month:${prev}`);
+              if (prevR) {
+                const prevParsed = JSON.parse(prevR.value);
+                const pp = prevParsed.payoutData;
+                if (pp && pp.funds) {
+                  // Remaining = startFunds - paidOut per pot
+                  const paidByPot = POT_KEYS.reduce((o, k) => { o[k] = 0; return o; }, {});
+                  Object.values(pp.payouts || {}).forEach(p => {
+                    if (p && p.paid && p.paidBy && paidByPot[p.paidBy] !== undefined) {
+                      paidByPot[p.paidBy] += Number(p.amount) || 0;
+                    }
+                  });
+                  const remaining = POT_KEYS.reduce((o, k) => {
+                    o[k] = Math.max(0, (Number(pp.funds[k]) || 0) - paidByPot[k]);
+                    return o;
+                  }, {});
+                  setPayoutData({ funds: remaining, payouts: {} });
+                } else {
+                  setPayoutData({ funds: emptyFunds(), payouts: {} });
+                }
+              } else {
+                setPayoutData({ funds: emptyFunds(), payouts: {} });
+              }
+            } catch (e) {
+              setPayoutData({ funds: emptyFunds(), payouts: {} });
+            }
           }
         })();
       }, [currentMonth, loading]);
@@ -398,11 +474,11 @@
         if (loading) return;
         const t = setTimeout(async () => {
           try {
-            await window.storage.set(`month:${currentMonth}`, JSON.stringify({ timeEntries, holidays, agentMonthData }));
+            await window.storage.set(`month:${currentMonth}`, JSON.stringify({ timeEntries, holidays, agentMonthData, payoutData }));
           } catch (e) { console.error(e); }
         }, 400);
         return () => clearTimeout(t);
-      }, [timeEntries, holidays, agentMonthData, currentMonth, loading]);
+      }, [timeEntries, holidays, agentMonthData, payoutData, currentMonth, loading]);
 
       function notify(msg, kind = 'success') {
         setNotification({ msg, kind });
@@ -543,6 +619,62 @@
       function addHoliday() { setHolidays(h => [...h, { id: genId(), date: '', name: '', hoursPerAgent: 8 }]); }
       function updateHoliday(id, field, value) { setHolidays(h => h.map(x => x.id === id ? { ...x, [field]: value } : x)); }
       function removeHoliday(id) { setHolidays(h => h.filter(x => x.id !== id)); }
+
+      /* ---------- Payouts ---------- */
+      function updateFund(potKey, amount) {
+        setPayoutData(pd => ({ ...pd, funds: { ...pd.funds, [potKey]: Number(amount) || 0 } }));
+      }
+      function updatePayoutField(agentId, field, value) {
+        setPayoutData(pd => ({
+          ...pd,
+          payouts: {
+            ...pd.payouts,
+            [agentId]: { ...(pd.payouts[agentId] || {}), [field]: value }
+          }
+        }));
+      }
+      function autoAssignPayouts(agents, computeAgentPayroll) {
+        const today = new Date().toISOString().slice(0, 10);
+        // Build wage list per agent
+        const wages = agents.map(a => {
+          const calc = computeAgentPayroll(a);
+          const currency = a.accountCurrency || 'EUR';
+          const method = a.payoutMethod || 'rekening';
+          return { agent: a, amount: calc.totalGross, currency, method };
+        }).filter(w => w.amount > 0);
+
+        // Sort: cash agents first (so cash pot gets used up before bank pots)
+        wages.sort((x, y) => {
+          if (x.method !== y.method) return x.method === 'cash' ? -1 : 1;
+          return y.amount - x.amount; // larger amounts first within group
+        });
+
+        const remaining = { ...payoutData.funds };
+        const newPayouts = { ...payoutData.payouts };
+
+        wages.forEach(w => {
+          const eligible = eligiblePotsFor(w.agent);
+          if (eligible.length === 0) return;
+          // Strategy: pick the first eligible pot that still has enough; if none has enough, pick the one with most.
+          let pick = eligible.find(k => remaining[k] >= w.amount);
+          if (!pick) pick = eligible.slice().sort((a, b) => remaining[b] - remaining[a])[0];
+          remaining[pick] = (remaining[pick] || 0) - w.amount;
+          newPayouts[w.agent.id] = {
+            ...(newPayouts[w.agent.id] || {}),
+            paidBy: pick,
+            amount: w.amount,
+            paidAt: newPayouts[w.agent.id]?.paidAt || today,
+            paid: newPayouts[w.agent.id]?.paid || false,
+          };
+        });
+
+        setPayoutData(pd => ({ ...pd, payouts: newPayouts }));
+        notify('Uitbetalingen automatisch toegewezen');
+      }
+      function clearPayoutAssignments() {
+        if (!confirm('Alle uitbetalings-toewijzingen voor deze maand wissen?')) return;
+        setPayoutData(pd => ({ ...pd, payouts: {} }));
+      }
 
       /* ---------- Agent month data ---------- */
       function getAgentMD(agentId) {
@@ -1074,6 +1206,7 @@
                 <TabBtn active={activeTab === 'setup'} onClick={() => setActiveTab('setup')} icon={<Settings size={15} />}>Instellingen</TabBtn>
                 <TabBtn active={activeTab === 'month'} onClick={() => setActiveTab('month')} icon={<Calendar size={15} />}>Loonperiode</TabBtn>
                 <TabBtn active={activeTab === 'payslips'} onClick={() => setActiveTab('payslips')} icon={<FileText size={15} />}>Loonstroken</TabBtn>
+                <TabBtn active={activeTab === 'payouts'} onClick={() => setActiveTab('payouts')} icon={<Wallet size={15} />}>Uitbetalingen</TabBtn>
               </div>
             </div>
           </header>
@@ -1113,6 +1246,18 @@
                 generatePDF={generatePDF} generateAllPDFs={generateAllPDFs}
                 generatePayoutSheet={generatePayoutSheet}
                 jsPdfLoaded={jsPdfLoaded} generating={generating}
+                currentMonth={currentMonth}
+              />
+            )}
+            {activeTab === 'payouts' && (
+              <PayoutsTab
+                agents={agents}
+                computeAgentPayroll={computeAgentPayroll}
+                payoutData={payoutData}
+                updateFund={updateFund}
+                updatePayoutField={updatePayoutField}
+                autoAssignPayouts={autoAssignPayouts}
+                clearPayoutAssignments={clearPayoutAssignments}
                 currentMonth={currentMonth}
               />
             )}
@@ -2028,6 +2173,264 @@
         <div className="flex justify-between py-1 border-b border-stone-50">
           <span className={bold ? 'text-stone-900 font-semibold' : 'text-stone-600'}>{label}</span>
           <span className={`tabular-nums ${bold ? 'text-stone-900 font-semibold' : 'text-stone-900 font-medium'}`}>{value}</span>
+        </div>
+      );
+    }
+
+    function PayoutsTab({ agents, computeAgentPayroll, payoutData, updateFund, updatePayoutField, autoAssignPayouts, clearPayoutAssignments, currentMonth }) {
+      const today = new Date().toISOString().slice(0, 10);
+      const funds = payoutData.funds || emptyFunds();
+      const payouts = payoutData.payouts || {};
+
+      const wages = useMemo(() => {
+        return agents.map(a => {
+          const calc = computeAgentPayroll(a);
+          return {
+            agent: a,
+            amount: calc.totalGross,
+            currency: a.accountCurrency || 'EUR',
+            method: a.payoutMethod || 'rekening',
+            eligible: eligiblePotsFor(a),
+          };
+        }).filter(w => w.amount > 0);
+      }, [agents, computeAgentPayroll]);
+
+      const totalsByCurrency = useMemo(() => {
+        const t = { EUR: 0, SRD: 0 };
+        wages.forEach(w => { t[w.currency] = (t[w.currency] || 0) + w.amount; });
+        return t;
+      }, [wages]);
+
+      const usedByPot = useMemo(() => {
+        const u = POT_KEYS.reduce((o, k) => { o[k] = 0; return o; }, {});
+        wages.forEach(w => {
+          const p = payouts[w.agent.id];
+          if (p && p.paidBy && u[p.paidBy] !== undefined) {
+            u[p.paidBy] += w.amount;
+          }
+        });
+        return u;
+      }, [wages, payouts]);
+
+      const remaining = POT_KEYS.reduce((o, k) => { o[k] = (Number(funds[k]) || 0) - usedByPot[k]; return o; }, {});
+
+      const totalAvailableEur = (funds.shenifaCashEur || 0) + (funds.shenifaBankEur || 0) + (funds.anouskaBankEur || 0);
+      const totalAvailableSrd = (funds.shenifaCashSrd || 0) + (funds.shenifaBankSrd || 0);
+      const totalRemainingEur = remaining.shenifaCashEur + remaining.shenifaBankEur + remaining.anouskaBankEur;
+      const totalRemainingSrd = remaining.shenifaCashSrd + remaining.shenifaBankSrd;
+
+      const cashOverEur = remaining.shenifaCashEur > 0;
+      const cashOverSrd = remaining.shenifaCashSrd > 0;
+      const negativePots = POT_KEYS.filter(k => remaining[k] < -0.001);
+
+      const eurPots = ['shenifaCashEur', 'shenifaBankEur', 'anouskaBankEur'];
+      const srdPots = ['shenifaCashSrd', 'shenifaBankSrd'];
+
+      return (
+        <div className="space-y-6">
+          <div className="flex items-baseline justify-between flex-wrap gap-3">
+            <div>
+              <div style={displayFont} className="text-3xl text-stone-900">Uitbetalingen</div>
+              <div className="text-sm text-stone-500 mt-1">{fmtMonth(currentMonth)} · {wages.length} medewerker(s) te betalen</div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={clearPayoutAssignments}
+                className="px-4 py-2 bg-white border border-stone-200 text-stone-700 rounded hover:bg-stone-50 inline-flex items-center gap-2 text-sm font-medium">
+                <Trash2 size={14} /> Toewijzingen wissen
+              </button>
+              <button onClick={() => autoAssignPayouts(agents, computeAgentPayroll)} disabled={wages.length === 0}
+                className="px-4 py-2 bg-emerald-900 text-white rounded hover:bg-emerald-800 inline-flex items-center gap-2 text-sm font-medium disabled:opacity-50">
+                <Wand size={14} /> Cash opmaken & automatisch toewijzen
+              </button>
+            </div>
+          </div>
+
+          {/* Beschikbaar */}
+          <Card icon={<Wallet size={18} />} title="Beschikbaar geld deze maand">
+            <div className="text-xs text-stone-500 mb-3">Vul in hoeveel geld er aan het begin van deze maand bij elke persoon ligt. Het overschot van vorige maand wordt automatisch overgenomen.</div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-2">
+              {eurPots.map(k => (
+                <div key={k}>
+                  <Label>{POT_LABELS[k]}</Label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 text-sm">€</span>
+                    <Input type="number" step="0.01" value={funds[k] || 0}
+                      onChange={(e) => updateFund(k, parseFloat(e.target.value) || 0)}
+                      className="pl-7" />
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {srdPots.map(k => (
+                <div key={k}>
+                  <Label>{POT_LABELS[k]}</Label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 text-[10px] font-semibold">SRD</span>
+                    <Input type="number" step="0.01" value={funds[k] || 0}
+                      onChange={(e) => updateFund(k, parseFloat(e.target.value) || 0)}
+                      className="pl-12" />
+                  </div>
+                </div>
+              ))}
+              <div className="hidden md:block"></div>
+            </div>
+          </Card>
+
+          {/* Lonen lijst */}
+          <Card icon={<Users size={18} />} title="Uitbetalen aan medewerkers">
+            {wages.length === 0 ? (
+              <Empty>Nog geen lonen voor deze maand. Vul eerst uren of bonussen in onder Loonperiode.</Empty>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-[10px] text-stone-500 uppercase tracking-wider font-medium border-b border-stone-200">
+                      <th className="text-left py-2 px-2">Medewerker</th>
+                      <th className="text-right py-2 px-2">Bedrag</th>
+                      <th className="text-left py-2 px-2">Methode</th>
+                      <th className="text-left py-2 px-2">Uitbetaald door</th>
+                      <th className="text-left py-2 px-2">Datum</th>
+                      <th className="text-center py-2 px-2">Voldaan</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {wages.map(w => {
+                      const p = payouts[w.agent.id] || {};
+                      const display = (w.agent.nickname || w.agent.name || 'Medewerker').trim();
+                      return (
+                        <tr key={w.agent.id} className="border-b border-stone-100 align-middle">
+                          <td className="py-2 px-2">
+                            <div className="font-medium text-stone-900">{w.agent.name || <span className="text-stone-400">Naamloos</span>}</div>
+                            {w.agent.nickname && <div className="text-xs text-stone-500">{w.agent.nickname}</div>}
+                          </td>
+                          <td className="py-2 px-2 text-right tabular-nums font-medium">{fmtMoney(w.amount, w.currency)}</td>
+                          <td className="py-2 px-2 text-stone-600">
+                            <span className="inline-flex items-center gap-1 text-xs">
+                              {w.method === 'cash' ? 'Cash' : 'Rekening'} · {w.currency}
+                            </span>
+                          </td>
+                          <td className="py-2 px-2">
+                            <select value={p.paidBy || ''}
+                              onChange={(e) => updatePayoutField(w.agent.id, 'paidBy', e.target.value || null)}
+                              className="px-2 py-1.5 text-sm border border-stone-200 rounded bg-white outline-none focus:border-emerald-700 min-w-[180px]">
+                              <option value="">— kies —</option>
+                              {w.eligible.map(k => <option key={k} value={k}>{POT_LABELS[k]}</option>)}
+                            </select>
+                            {w.eligible.length === 0 && (
+                              <div className="text-xs text-rose-600 mt-1">Geen geschikte pot voor {w.method}/{w.currency}</div>
+                            )}
+                          </td>
+                          <td className="py-2 px-2">
+                            <input type="date" value={p.paidAt || ''}
+                              onChange={(e) => updatePayoutField(w.agent.id, 'paidAt', e.target.value)}
+                              className="px-2 py-1.5 text-sm border border-stone-200 rounded bg-white outline-none focus:border-emerald-700" />
+                          </td>
+                          <td className="py-2 px-2 text-center">
+                            <input type="checkbox" checked={!!p.paid}
+                              onChange={(e) => updatePayoutField(w.agent.id, 'paid', e.target.checked)}
+                              className="w-4 h-4 accent-emerald-700" />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot>
+                    <tr className="font-semibold text-stone-900">
+                      <td className="py-2 px-2">Totaal lonen</td>
+                      <td className="py-2 px-2 text-right tabular-nums">
+                        {totalsByCurrency.EUR > 0 && <div>{fmtEuro(totalsByCurrency.EUR)}</div>}
+                        {totalsByCurrency.SRD > 0 && <div>{fmtSrd(totalsByCurrency.SRD)}</div>}
+                      </td>
+                      <td colSpan="4"></td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            )}
+          </Card>
+
+          {/* Saldo */}
+          <Card icon={<Wallet size={18} />} title="Saldo per pot">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+              {eurPots.map(k => {
+                const start = Number(funds[k]) || 0;
+                const used = usedByPot[k];
+                const left = remaining[k];
+                const negative = left < -0.001;
+                return (
+                  <div key={k} className={`p-3 rounded border ${negative ? 'border-rose-300 bg-rose-50' : 'border-stone-200 bg-stone-50'}`}>
+                    <div className="text-xs text-stone-500 font-medium uppercase tracking-wider mb-1">{POT_LABELS[k]}</div>
+                    <div className="text-lg font-semibold tabular-nums text-stone-900">{fmtEuro(left)}</div>
+                    <div className="text-xs text-stone-500 mt-1">
+                      Start {fmtEuro(start)} − uitbetaald {fmtEuro(used)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {srdPots.map(k => {
+                const start = Number(funds[k]) || 0;
+                const used = usedByPot[k];
+                const left = remaining[k];
+                const negative = left < -0.001;
+                return (
+                  <div key={k} className={`p-3 rounded border ${negative ? 'border-rose-300 bg-rose-50' : 'border-stone-200 bg-stone-50'}`}>
+                    <div className="text-xs text-stone-500 font-medium uppercase tracking-wider mb-1">{POT_LABELS[k]}</div>
+                    <div className="text-lg font-semibold tabular-nums text-stone-900">{fmtSrd(left)}</div>
+                    <div className="text-xs text-stone-500 mt-1">
+                      Start {fmtSrd(start)} − uitbetaald {fmtSrd(used)}
+                    </div>
+                  </div>
+                );
+              })}
+              <div className="hidden md:block"></div>
+            </div>
+
+            <div className="border-t border-stone-200 mt-5 pt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="p-3 rounded bg-emerald-50 border border-emerald-200">
+                <div className="text-xs text-emerald-900 font-medium uppercase tracking-wider mb-1">Totaal over (€)</div>
+                <div className="text-2xl font-semibold tabular-nums text-emerald-900">{fmtEuro(totalRemainingEur)}</div>
+                <div className="text-xs text-emerald-700 mt-1">Van {fmtEuro(totalAvailableEur)} beschikbaar</div>
+              </div>
+              <div className="p-3 rounded bg-emerald-50 border border-emerald-200">
+                <div className="text-xs text-emerald-900 font-medium uppercase tracking-wider mb-1">Totaal over (SRD)</div>
+                <div className="text-2xl font-semibold tabular-nums text-emerald-900">{fmtSrd(totalRemainingSrd)}</div>
+                <div className="text-xs text-emerald-700 mt-1">Van {fmtSrd(totalAvailableSrd)} beschikbaar</div>
+              </div>
+            </div>
+
+            {(cashOverEur || cashOverSrd || negativePots.length > 0) && (
+              <div className="mt-4 space-y-2">
+                {negativePots.map(k => (
+                  <div key={k} className="flex items-start gap-2 p-3 rounded bg-rose-50 border border-rose-200 text-sm">
+                    <AlertTriangle size={16} className="text-rose-600 mt-0.5 flex-shrink-0" />
+                    <div className="text-rose-800">
+                      <strong>{POT_LABELS[k]}</strong> is overschreden met {POT_META[k].currency === 'SRD' ? fmtSrd(-remaining[k]) : fmtEuro(-remaining[k])}.
+                      Verlaag een toewijzing of vul meer geld bij.
+                    </div>
+                  </div>
+                ))}
+                {cashOverEur && (
+                  <div className="flex items-start gap-2 p-3 rounded bg-amber-50 border border-amber-200 text-sm">
+                    <AlertTriangle size={16} className="text-amber-600 mt-0.5 flex-shrink-0" />
+                    <div className="text-amber-900">
+                      Er is nog <strong>{fmtEuro(remaining.shenifaCashEur)}</strong> cash (€) over bij Shenifa. Cash moet elke maand worden opgemaakt.
+                    </div>
+                  </div>
+                )}
+                {cashOverSrd && (
+                  <div className="flex items-start gap-2 p-3 rounded bg-amber-50 border border-amber-200 text-sm">
+                    <AlertTriangle size={16} className="text-amber-600 mt-0.5 flex-shrink-0" />
+                    <div className="text-amber-900">
+                      Er is nog <strong>{fmtSrd(remaining.shenifaCashSrd)}</strong> cash (SRD) over bij Shenifa.
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </Card>
         </div>
       );
     }
