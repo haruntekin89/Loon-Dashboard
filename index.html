@@ -1072,12 +1072,27 @@
         if (agents.length === 0) { notify('Geen medewerkers om te exporteren', 'error'); return; }
         const XLSX = window.XLSX;
 
-        const headers = ['REKENINGNAAM', 'Rekeningnummer', 'Swiftcode', 'R.Soort', 'Totaal Agents loon', 'NAAM', 'HOE'];
+        const headers = [
+          'REKENINGNAAM', 'Rekeningnummer', 'Swiftcode', 'R.Soort',
+          'Loon (€)', 'NAAM', 'HOE',
+          'Uitbetaald door', 'Pot', 'Koers (€1=SRD)', 'Bedrag uitbetaald', 'Datum', 'Voldaan'
+        ];
         const rows = [headers];
-        let total = 0;
+        const payouts = (payoutData && payoutData.payouts) || {};
+        let totalEur = 0;
+        let totalSrd = 0;
         for (const a of agents) {
           const calc = computeAgentPayroll(a);
-          total += calc.totalGross;
+          totalEur += calc.totalGross;
+          const p = payouts[a.id] || {};
+          const potKey = p.paidBy || null;
+          const meta = potKey ? POT_META[potKey] : null;
+          const actualMethod = meta ? meta.method : (a.payoutMethod || '');
+          const holder = meta ? meta.holder : '';
+          const potCurrency = meta ? meta.currency : '';
+          const rate = (meta && meta.currency === 'SRD') ? (Number(p.exchangeRate) || 0) : null;
+          const debited = potKey ? potDebit(calc.totalGross, potKey, p.exchangeRate) : 0;
+          if (potCurrency === 'SRD') totalSrd += debited;
           rows.push([
             a.name || '',
             a.bankAccount || '',
@@ -1085,20 +1100,31 @@
             a.accountCurrency || 'EUR',
             Number(calc.totalGross.toFixed(2)),
             a.nickname || '',
-            a.payoutMethod === 'cash' ? 'Cash' : (a.payoutMethod === 'rekening' ? 'Rekening' : '')
+            actualMethod === 'cash' ? 'Cash' : (actualMethod === 'rekening' ? 'Rekening' : ''),
+            holder,
+            potKey ? POT_LABELS[potKey] : '',
+            rate !== null && rate > 0 ? rate : '',
+            potKey ? Number(debited.toFixed(2)) : '',
+            p.paidAt || '',
+            p.paid ? 'Ja' : (potKey ? 'Nee' : '')
           ]);
         }
-        rows.push(['TOTAAL', '', '', '', Number(total.toFixed(2)), '', '']);
+        rows.push([
+          'TOTAAL', '', '', '',
+          Number(totalEur.toFixed(2)), '', '',
+          '', '', '',
+          totalSrd > 0 ? 'SRD ' + totalSrd.toFixed(2) : '',
+          '', ''
+        ]);
 
         const ws = XLSX.utils.aoa_to_sheet(rows);
 
-        // Column widths
         ws['!cols'] = [
           { wch: 28 }, { wch: 18 }, { wch: 14 }, { wch: 8 },
-          { wch: 18 }, { wch: 14 }, { wch: 12 }
+          { wch: 12 }, { wch: 14 }, { wch: 10 },
+          { wch: 14 }, { wch: 22 }, { wch: 14 }, { wch: 18 }, { wch: 12 }, { wch: 9 }
         ];
 
-        // Format euro column (E) with currency, set bold for header & TOTAAL row
         const range = XLSX.utils.decode_range(ws['!ref']);
         const totalRowIdx = rows.length - 1;
         for (let R = range.s.r; R <= range.e.r; R++) {
@@ -1107,10 +1133,17 @@
             const cell = ws[addr];
             if (!cell) continue;
             if (!cell.s) cell.s = {};
-            // Euro column
-            if (C === 4 && R > 0) {
+            // EUR loon column (E, idx 4)
+            if (C === 4 && R > 0 && R < totalRowIdx) {
               cell.t = 'n';
               cell.z = '"€" #,##0.00';
+            }
+            // Bedrag uitbetaald column (K, idx 10) — show pot currency depending on row
+            if (C === 10 && R > 0 && R < totalRowIdx && typeof cell.v === 'number') {
+              cell.t = 'n';
+              // Determine if SRD by checking the koers cell of same row
+              const rateCell = ws[XLSX.utils.encode_cell({ r: R, c: 9 })];
+              cell.z = (rateCell && rateCell.v) ? '"SRD " #,##0.00' : '"€" #,##0.00';
             }
             // Header bold
             if (R === 0) {
@@ -1119,6 +1152,10 @@
             // TOTAAL row bold
             if (R === totalRowIdx) {
               cell.s.font = { bold: true, sz: 12 };
+              if (C === 4) {
+                cell.t = 'n';
+                cell.z = '"€" #,##0.00';
+              }
             }
           }
         }
@@ -2385,17 +2422,27 @@
                           </td>
                           <td className="py-2 px-2 text-right tabular-nums font-medium">{fmtEuro(w.amount)}</td>
                           <td className="py-2 px-2 text-stone-600">
-                            <span className="inline-flex items-center gap-1 text-xs">
-                              {w.method === 'cash' ? 'Cash' : 'Rekening'}
-                              {w.accountCurrency === 'SRD' && <span className="px-1 py-0.5 bg-amber-100 text-amber-800 text-[9px] rounded font-medium">SRD-rek.</span>}
-                            </span>
+                            {(() => {
+                              const actualMethod = p.paidBy ? POT_META[p.paidBy].method : w.method;
+                              const overridden = p.paidBy && actualMethod !== w.method;
+                              return (
+                                <span className="inline-flex items-center gap-1 text-xs">
+                                  {actualMethod === 'cash' ? 'Cash' : 'Rekening'}
+                                  {overridden && <span className="px-1 py-0.5 bg-blue-100 text-blue-800 text-[9px] rounded font-medium" title={`Standaard: ${w.method}`}>aangepast</span>}
+                                  {w.accountCurrency === 'SRD' && <span className="px-1 py-0.5 bg-amber-100 text-amber-800 text-[9px] rounded font-medium">SRD-rek.</span>}
+                                </span>
+                              );
+                            })()}
                           </td>
                           <td className="py-2 px-2">
                             <select value={p.paidBy || ''}
                               onChange={(e) => updatePayoutField(w.agent.id, 'paidBy', e.target.value || null)}
                               className="px-2 py-1.5 text-sm border border-stone-200 rounded bg-white outline-none focus:border-emerald-700 min-w-[180px]">
                               <option value="">— kies —</option>
-                              {w.eligible.map(k => <option key={k} value={k}>{POT_LABELS[k]}</option>)}
+                              {POT_KEYS.map(k => {
+                                const isDefault = w.eligible.includes(k);
+                                return <option key={k} value={k}>{POT_LABELS[k]}{isDefault ? '' : ' (afwijkend)'}</option>;
+                              })}
                             </select>
                             {isSrdPot && (
                               <div className="mt-1.5 flex items-center gap-1.5">
@@ -2409,9 +2456,6 @@
                                   <span className="text-[11px] text-emerald-800 font-medium ml-1">= {fmtSrd(srdAmount)}</span>
                                 )}
                               </div>
-                            )}
-                            {w.eligible.length === 0 && (
-                              <div className="text-xs text-rose-600 mt-1">Geen geschikte pot voor methode "{w.method}"</div>
                             )}
                           </td>
                           <td className="py-2 px-2">
