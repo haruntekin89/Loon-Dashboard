@@ -202,8 +202,15 @@
       return POT_KEYS.reduce((o, k) => { o[k] = 0; return o; }, {});
     }
     function eligiblePotsFor(agent) {
-      const method = agent.payoutMethod || 'rekening';
-      return POT_KEYS.filter(k => POT_META[k].method === method);
+      // Cash pots are always possible regardless of the agent's account currency.
+      // Bank pots only when the pot's currency matches the agent's account currency
+      // (you can't transfer EUR to an SRD account or vice versa).
+      const accountCurrency = agent.accountCurrency || 'EUR';
+      return POT_KEYS.filter(k => {
+        const m = POT_META[k];
+        if (m.method === 'cash') return true;
+        return m.currency === accountCurrency;
+      });
     }
     function potDebit(eurAmount, potKey, exchangeRate) {
       // EUR pots: debit is the EUR amount itself.
@@ -661,11 +668,15 @@
         const newPayouts = { ...payoutData.payouts };
 
         wages.forEach(w => {
-          // Prefer EUR pots since wages are EUR; only consider EUR for auto-assign.
-          const eligible = eligiblePotsFor(w.agent).filter(k => POT_META[k].currency === 'EUR');
-          if (eligible.length === 0) return;
-          let pick = eligible.find(k => remaining[k] >= w.amount);
-          if (!pick) pick = eligible.slice().sort((a, b) => remaining[b] - remaining[a])[0];
+          // Auto-assign uses EUR pots only (wages are EUR; SRD requires manual rate).
+          const eurEligible = eligiblePotsFor(w.agent).filter(k => POT_META[k].currency === 'EUR');
+          if (eurEligible.length === 0) return;
+          // Prefer agent's default method first.
+          const preferred = eurEligible.filter(k => POT_META[k].method === w.method);
+          const fallback = eurEligible.filter(k => POT_META[k].method !== w.method);
+          const ordered = [...preferred, ...fallback];
+          let pick = ordered.find(k => remaining[k] >= w.amount);
+          if (!pick) pick = ordered.slice().sort((a, b) => remaining[b] - remaining[a])[0];
           remaining[pick] = (remaining[pick] || 0) - w.amount;
           newPayouts[w.agent.id] = {
             ...(newPayouts[w.agent.id] || {}),
@@ -2439,10 +2450,10 @@
                               onChange={(e) => updatePayoutField(w.agent.id, 'paidBy', e.target.value || null)}
                               className="px-2 py-1.5 text-sm border border-stone-200 rounded bg-white outline-none focus:border-emerald-700 min-w-[180px]">
                               <option value="">— kies —</option>
-                              {POT_KEYS.map(k => {
-                                const isDefault = w.eligible.includes(k);
-                                return <option key={k} value={k}>{POT_LABELS[k]}{isDefault ? '' : ' (afwijkend)'}</option>;
-                              })}
+                              {w.eligible.map(k => <option key={k} value={k}>{POT_LABELS[k]}</option>)}
+                              {p.paidBy && !w.eligible.includes(p.paidBy) && (
+                                <option value={p.paidBy}>{POT_LABELS[p.paidBy]} (verlopen)</option>
+                              )}
                             </select>
                             {isSrdPot && (
                               <div className="mt-1.5 flex items-center gap-1.5">
