@@ -632,7 +632,10 @@
         const wage = Number(agent.hourlyWage) || 0;
         const workPay = workHours * wage;
 
-        const totalHolidayHours = holidays.reduce((s, h) => s + (Number(h.hoursPerAgent) || 0), 0);
+        const receivesHolidayPay = agent.holidayPayEnabled !== false;
+        const totalHolidayHours = receivesHolidayPay
+          ? holidays.reduce((s, h) => s + (Number(h.hoursPerAgent) || 0), 0)
+          : 0;
         const holidayPay = totalHolidayHours * wage;
 
         const md = getAgentMD(agent.id);
@@ -786,7 +789,7 @@
         }
         y += 3;
 
-        if (holidays.length > 0) {
+        if (holidays.length > 0 && c.totalHolidayHours > 0) {
           sectionHeader('Feestdagen');
           holidays.forEach(h => {
             const hours = Number(h.hoursPerAgent) || 0;
@@ -1314,6 +1317,18 @@
                     <option value="EUR">EUR</option>
                     <option value="SRD">SRD</option>
                   </select>
+                </div>
+                <div className="md:col-span-2">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={agent.holidayPayEnabled !== false}
+                      onChange={(e) => updateAgent(agent.id, 'holidayPayEnabled', e.target.checked)}
+                      className="w-4 h-4 accent-emerald-700"
+                    />
+                    <span className="text-sm text-stone-700">Feestdagen uitbetalen</span>
+                  </label>
+                  <div className="text-xs text-stone-500 mt-1 ml-6">Uitvinken als deze medewerker geen feestdagen-vergoeding krijgt.</div>
                 </div>
               </div>
 
