@@ -633,9 +633,17 @@
       }
 
       /* ---------- Holidays ---------- */
-      function addHoliday() { setHolidays(h => [...h, { id: genId(), date: '', name: '', hoursPerAgent: 8 }]); }
+      function addHoliday() { setHolidays(h => [...h, { id: genId(), date: '', name: '', hoursPerAgent: 8, excludedAgentIds: [] }]); }
       function updateHoliday(id, field, value) { setHolidays(h => h.map(x => x.id === id ? { ...x, [field]: value } : x)); }
       function removeHoliday(id) { setHolidays(h => h.filter(x => x.id !== id)); }
+      function toggleHolidayForAgent(holidayId, agentId, included) {
+        setHolidays(hs => hs.map(h => {
+          if (h.id !== holidayId) return h;
+          const ex = new Set(h.excludedAgentIds || []);
+          if (included) ex.delete(agentId); else ex.add(agentId);
+          return { ...h, excludedAgentIds: Array.from(ex) };
+        }));
+      }
 
       /* ---------- Payouts ---------- */
       function updateFund(potKey, amount) {
@@ -788,9 +796,10 @@
         const workPay = workHours * wage;
 
         const receivesHolidayPay = agent.holidayPayEnabled !== false;
-        const totalHolidayHours = receivesHolidayPay
-          ? holidays.reduce((s, h) => s + (Number(h.hoursPerAgent) || 0), 0)
-          : 0;
+        const paidHolidays = receivesHolidayPay
+          ? holidays.filter(h => !(h.excludedAgentIds || []).includes(agent.id))
+          : [];
+        const totalHolidayHours = paidHolidays.reduce((s, h) => s + (Number(h.hoursPerAgent) || 0), 0);
         const holidayPay = totalHolidayHours * wage;
 
         const md = getAgentMD(agent.id);
@@ -844,7 +853,7 @@
         return {
           workHours, workPay, wage,
           projectGroups,
-          totalHolidayHours, holidayPay,
+          totalHolidayHours, holidayPay, paidHolidays,
           incentiveHours: incHours, incentivePay,
           systemOutages, outageHours, outagePay,
           toiletHours, toiletPay,
@@ -944,9 +953,9 @@
         }
         y += 3;
 
-        if (holidays.length > 0 && c.totalHolidayHours > 0) {
+        if ((c.paidHolidays || []).length > 0 && c.totalHolidayHours > 0) {
           sectionHeader('Feestdagen');
-          holidays.forEach(h => {
+          c.paidHolidays.forEach(h => {
             const hours = Number(h.hoursPerAgent) || 0;
             row(h.name || h.date || 'Feestdag', fmtHours(hours) + ' uur', fmtEuro(c.wage), fmtEuro(hours * c.wage));
           });
@@ -1211,6 +1220,14 @@
         notify(`${csvName} gekoppeld aan ${agent.name || agent.nickname || 'medewerker'}`);
       }
 
+      function removeUnmatchedCsvName(key) {
+        const removed = timeEntries.filter(e => e.agentKey === key);
+        if (removed.length === 0) return;
+        const name = removed[0].agentDisplayName || key;
+        setTimeEntries(es => es.filter(e => e.agentKey !== key));
+        notify(`${name} verwijderd (${removed.length} regel(s))`);
+      }
+
       /* ---------- Render ---------- */
       if (loading) {
         return (
@@ -1282,6 +1299,7 @@
                 hourBonusTiers={hourBonusTiers} addHourBonusTier={addHourBonusTier}
                 updateHourBonusTier={updateHourBonusTier} removeHourBonusTier={removeHourBonusTier}
                 toiletAllowanceHours={toiletAllowanceHours} setToiletAllowanceHours={setToiletAllowanceHours}
+                holidays={holidays} toggleHolidayForAgent={toggleHolidayForAgent}
               />
             )}
             {activeTab === 'month' && (
@@ -1290,7 +1308,7 @@
                 timeEntries={timeEntries} handleCsvUpload={handleCsvUpload} clearTimeEntries={clearTimeEntries}
                 addTimeEntry={addTimeEntry} updateTimeEntry={updateTimeEntry} removeTimeEntry={removeTimeEntry}
                 unmatchedCsvNames={unmatchedCsvNames} addAgentFromCsv={addAgentFromCsv}
-                linkCsvNameToAgent={linkCsvNameToAgent}
+                linkCsvNameToAgent={linkCsvNameToAgent} removeUnmatchedCsvName={removeUnmatchedCsvName}
                 csvMatchSummary={csvMatchSummary}
                 holidays={holidays} addHoliday={addHoliday} updateHoliday={updateHoliday} removeHoliday={removeHoliday}
                 agents={agents} projects={projects}
@@ -1347,12 +1365,17 @@
       addFixedAllowance, updateFixedAllowance, removeFixedAllowance,
       projects, addProject, updateProject, removeProject, addTier, updateTier, removeTier,
       hourBonusTiers, addHourBonusTier, updateHourBonusTier, removeHourBonusTier,
-      toiletAllowanceHours, setToiletAllowanceHours }) {
+      toiletAllowanceHours, setToiletAllowanceHours,
+      holidays, toggleHolidayForAgent }) {
 
       const [agentSearch, setAgentSearch] = useState('');
       const filteredAgents = useMemo(
         () => agents.filter(a => agentMatchesSearch(a, agentSearch)),
         [agents, agentSearch]
+      );
+      const missingAccountCount = useMemo(
+        () => agents.filter(isMissingAccount).length,
+        [agents]
       );
 
       return (
@@ -1387,7 +1410,18 @@
             </div>
           </Card>
 
-          <Card icon={<Users size={18} />} title={`Medewerkers${agents.length > 0 ? ` (${agents.length})` : ''}`} action={<BtnPrimary onClick={addAgent}><Plus size={14} /> Toevoegen</BtnPrimary>}>
+          <Card icon={<Users size={18} />}
+            title={
+              <span className="flex items-center gap-2 flex-wrap">
+                <span>{`Medewerkers${agents.length > 0 ? ` (${agents.length})` : ''}`}</span>
+                {missingAccountCount > 0 && (
+                  <span className="text-xs font-medium px-2 py-0.5 bg-rose-100 text-rose-700 border border-rose-200 rounded-full">
+                    {missingAccountCount} zonder rekeningnummer
+                  </span>
+                )}
+              </span>
+            }
+            action={<BtnPrimary onClick={addAgent}><Plus size={14} /> Toevoegen</BtnPrimary>}>
             {agents.length === 0 ? (
               <Empty>Nog geen medewerkers. Voeg ze handmatig toe of upload een CSV in de Loonperiode-tab.</Empty>
             ) : (
@@ -1406,7 +1440,8 @@
                   <div className="divide-y divide-stone-100 -mx-2">
                     {filteredAgents.map(a => (
                       <AgentRow key={a.id} agent={a} updateAgent={updateAgent} removeAgent={removeAgent}
-                        addFixedAllowance={addFixedAllowance} updateFixedAllowance={updateFixedAllowance} removeFixedAllowance={removeFixedAllowance} />
+                        addFixedAllowance={addFixedAllowance} updateFixedAllowance={updateFixedAllowance} removeFixedAllowance={removeFixedAllowance}
+                        holidays={holidays} toggleHolidayForAgent={toggleHolidayForAgent} />
                     ))}
                   </div>
                 )}
@@ -1474,7 +1509,11 @@
       );
     }
 
-    function AgentRow({ agent, updateAgent, removeAgent, addFixedAllowance, updateFixedAllowance, removeFixedAllowance }) {
+    function isMissingAccount(agent) {
+      return (agent.payoutMethod || 'rekening') === 'rekening' && !(agent.bankAccount || '').trim();
+    }
+
+    function AgentRow({ agent, updateAgent, removeAgent, addFixedAllowance, updateFixedAllowance, removeFixedAllowance, holidays, toggleHolidayForAgent }) {
       const [open, setOpen] = useState(false);
       const allowances = agent.fixedAllowances || [];
       const allowanceTotal = allowances.reduce((s, a) => s + (Number(a.amount) || 0), 0);
@@ -1485,6 +1524,11 @@
               {open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
             </button>
             <Input value={agent.name} onChange={(e) => updateAgent(agent.id, 'name', e.target.value)} placeholder="Volledige naam" className="flex-1 min-w-0" />
+            {isMissingAccount(agent) && (
+              <span className="text-xs font-medium px-2 py-0.5 bg-rose-100 text-rose-700 border border-rose-200 rounded-full whitespace-nowrap flex-shrink-0">
+                Geen rekeningnr.
+              </span>
+            )}
             <div className="relative w-[120px] flex-shrink-0">
               <span className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 text-sm">€</span>
               <Input type="number" step="0.01" value={agent.hourlyWage} onChange={(e) => updateAgent(agent.id, 'hourlyWage', parseFloat(e.target.value) || 0)} className="pl-7" placeholder="0,00" />
@@ -1534,7 +1578,38 @@
                     />
                     <span className="text-sm text-stone-700">Feestdagen uitbetalen</span>
                   </label>
-                  <div className="text-xs text-stone-500 mt-1 ml-6">Uitvinken als deze medewerker geen feestdagen-vergoeding krijgt.</div>
+                  <div className="text-xs text-stone-500 mt-1 ml-6">Uitvinken als deze medewerker helemaal geen feestdagen-vergoeding krijgt.</div>
+                  {agent.holidayPayEnabled !== false && (
+                    <div className="mt-2 ml-6">
+                      {(holidays || []).length === 0 ? (
+                        <div className="text-xs text-stone-400">Geen feestdagen in deze loonperiode.</div>
+                      ) : (
+                        <>
+                          <div className="text-xs text-stone-500 mb-1.5">Welke feestdagen krijgt deze medewerker?</div>
+                          <div className="flex flex-col gap-1.5">
+                            {holidays.map(h => {
+                              const included = !(h.excludedAgentIds || []).includes(agent.id);
+                              return (
+                                <label key={h.id} className="flex items-center gap-2 cursor-pointer select-none">
+                                  <input
+                                    type="checkbox"
+                                    checked={included}
+                                    onChange={(e) => toggleHolidayForAgent(h.id, agent.id, e.target.checked)}
+                                    className="w-4 h-4 accent-emerald-700"
+                                  />
+                                  <span className="text-sm text-stone-700">
+                                    {h.name || h.date || 'Feestdag'}
+                                    {h.date && (h.name ? ` · ${h.date}` : '')}
+                                    {Number(h.hoursPerAgent) ? ` · ${h.hoursPerAgent} uur` : ''}
+                                  </span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -1622,7 +1697,7 @@
     /* ------------------------- Month Tab ------------------------- */
     function MonthTab({ currentMonth, timeEntries, handleCsvUpload, clearTimeEntries,
       addTimeEntry, updateTimeEntry, removeTimeEntry,
-      unmatchedCsvNames, addAgentFromCsv, linkCsvNameToAgent, csvMatchSummary,
+      unmatchedCsvNames, addAgentFromCsv, linkCsvNameToAgent, removeUnmatchedCsvName, csvMatchSummary,
       holidays, addHoliday, updateHoliday, removeHoliday,
       agents, projects, getAgentMD,
       setIncentiveHours, setSales, addManualBonus, updateManualBonus, removeManualBonus,
@@ -1685,7 +1760,8 @@
                     <UnmatchedRow key={u.key} csvName={u.name}
                       agents={agents}
                       onLink={(agentId) => linkCsvNameToAgent(u.name, agentId)}
-                      onAddNew={() => addAgentFromCsv(u.name)} />
+                      onAddNew={() => addAgentFromCsv(u.name)}
+                      onDelete={() => removeUnmatchedCsvName(u.key)} />
                   ))}
                 </div>
               </div>
@@ -1907,7 +1983,7 @@
     }
 
     /* ------------------------- Add time entry form ------------------------- */
-    function UnmatchedRow({ csvName, agents, onLink, onAddNew }) {
+    function UnmatchedRow({ csvName, agents, onLink, onAddNew, onDelete }) {
       const [selectValue, setSelectValue] = useState('');
       const sortedAgents = useMemo(
         () => [...agents].filter(a => a.name?.trim() || a.nickname?.trim())
@@ -1934,6 +2010,10 @@
           </select>
           <button onClick={onAddNew} className="text-xs px-2 py-1 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded text-amber-900 whitespace-nowrap">
             + Nieuwe medewerker
+          </button>
+          <button onClick={onDelete} title="Verwijder deze naam en bijbehorende uren-regels"
+            className="text-stone-400 hover:text-rose-600 p-1 flex-shrink-0">
+            <Trash2 size={15} />
           </button>
         </div>
       );
