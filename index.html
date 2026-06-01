@@ -838,8 +838,8 @@
         const toiletHours = Number(toiletAllowanceHours) || 0;
         const toiletPay = toiletHours * wage;
 
-        // Hour bonus — work + incentive + outage hours count
-        const qualifyingHours = workHours + incHours + outageHours;
+        // Hour bonus — work + incentive + outage + holiday hours count
+        const qualifyingHours = workHours + incHours + outageHours + totalHolidayHours;
         const hourBonusResult = calcHourBonus(qualifyingHours, hourBonusTiers);
         const hourBonusAmount = hourBonusResult.amount;
 
@@ -1470,7 +1470,7 @@
 
           <Card icon={<Clock size={18} />} title="Uren-bonus" action={<BtnPrimary onClick={addHourBonusTier}><Plus size={14} /> Drempel</BtnPrimary>}>
             <div className="text-xs text-stone-500 mb-3">
-              Bonus op basis van totaal uren in de maand. Telt mee: werkuren + incentive uren + systeemstoringen. De hoogste drempel die de agent haalt wordt toegepast.
+              Bonus op basis van totaal uren in de maand. Telt mee: werkuren + incentive uren + systeemstoringen + feestdaguren. De hoogste drempel die de agent haalt wordt toegepast.
             </div>
             {hourBonusTiers.length === 0 ? (
               <Empty>Nog geen drempels ingesteld.</Empty>
