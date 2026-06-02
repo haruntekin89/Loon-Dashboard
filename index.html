@@ -458,9 +458,24 @@
                     }
                   });
                   const remaining = POT_KEYS.reduce((o, k) => {
-                    o[k] = Math.max(0, (Number(pp.funds[k]) || 0) - paidByPot[k]);
+                    o[k] = (Number(pp.funds[k]) || 0) - paidByPot[k];
                     return o;
                   }, {});
+                  // SRD-tekort uit euro dekken (zelfde regel als in Saldo per pot):
+                  // SRD-pot niet negatief, tekort omgerekend met saldo-koers van
+                  // Shenifa rekening (€) afgehaald — zodat de euro-overdracht klopt.
+                  const prevRate = Number(pp.saldoRate) || 0;
+                  if (prevRate > 0) {
+                    let coverEur = 0;
+                    ['shenifaCashSrd', 'shenifaBankSrd'].forEach(k => {
+                      const shortSrd = Math.max(0, paidByPot[k] - (Number(pp.funds[k]) || 0));
+                      if (shortSrd > 0) coverEur += shortSrd / prevRate;
+                      remaining[k] = Math.max(0, remaining[k]);
+                    });
+                    remaining.shenifaBankEur -= coverEur;
+                  }
+                  // Vloer alle potten op 0 voor de startsaldo's van volgende maand.
+                  POT_KEYS.forEach(k => { remaining[k] = Math.max(0, remaining[k]); });
                   setPayoutData({ funds: remaining, payouts: {}, saldoRate: Number(pp.saldoRate) || 0 });
                 } else {
                   setPayoutData({ funds: emptyFunds(), payouts: {}, saldoRate: 0 });
@@ -2357,7 +2372,29 @@
         return u;
       }, [wages, payouts]);
 
-      const remaining = POT_KEYS.reduce((o, k) => { o[k] = (Number(funds[k]) || 0) - usedByPot[k]; return o; }, {});
+      const eurPots = ['shenifaCashEur', 'shenifaBankEur', 'anouskaBankEur'];
+      const srdPots = ['shenifaCashSrd', 'shenifaBankSrd'];
+
+      const rawRemaining = POT_KEYS.reduce((o, k) => { o[k] = (Number(funds[k]) || 0) - usedByPot[k]; return o; }, {});
+
+      // SRD-tekort dekken uit euro: een SRD-pot die op 0 (of te laag) staat,
+      // mag niet negatief blijven. Het tekort wordt met de saldo-koers omgerekend
+      // naar euro en afgetrokken van Shenifa rekening (€). Alleen mogelijk met een
+      // saldo-koers; zonder koers valt het terug op het oude gedrag (SRD mag negatief).
+      const SRD_SPILL_TARGET = 'shenifaBankEur'; // Shenifa rekening (€)
+      const srdCoveredEur = {}; // per SRD-pot: hoeveel euro het tekort dekt
+      let srdCoveredEurTotal = 0;
+      const remaining = POT_KEYS.reduce((o, k) => { o[k] = rawRemaining[k]; return o; }, {});
+      if (saldoRate > 0) {
+        srdPots.forEach(k => {
+          const shortSrd = Math.max(0, usedByPot[k] - (Number(funds[k]) || 0));
+          const eur = shortSrd > 0 ? srdToEur(shortSrd) : 0;
+          srdCoveredEur[k] = eur;
+          srdCoveredEurTotal += eur;
+          remaining[k] = Math.max(0, remaining[k]);
+        });
+        remaining[SRD_SPILL_TARGET] = rawRemaining[SRD_SPILL_TARGET] - srdCoveredEurTotal;
+      }
 
       const totalAvailableEur = (funds.shenifaCashEur || 0) + (funds.shenifaBankEur || 0) + (funds.anouskaBankEur || 0);
       const totalAvailableSrd = (funds.shenifaCashSrd || 0) + (funds.shenifaBankSrd || 0);
@@ -2378,9 +2415,6 @@
       const cashOverEur = remaining.shenifaCashEur > 0;
       const cashOverSrd = remaining.shenifaCashSrd > 0;
       const negativePots = POT_KEYS.filter(k => remaining[k] < -0.001);
-
-      const eurPots = ['shenifaCashEur', 'shenifaBankEur', 'anouskaBankEur'];
-      const srdPots = ['shenifaCashSrd', 'shenifaBankSrd'];
 
       const sortedWages = useMemo(() => {
         const arr = wages.slice();
@@ -2657,6 +2691,7 @@
               {eurPots.map(k => {
                 const start = Number(funds[k]) || 0;
                 const used = usedByPot[k];
+                const srdCover = k === SRD_SPILL_TARGET ? srdCoveredEurTotal : 0;
                 const left = remaining[k];
                 const negative = left < -0.001;
                 return (
@@ -2666,6 +2701,11 @@
                     <div className="text-xs text-stone-500 mt-1">
                       Start {fmtEuro(start)} − uitbetaald {fmtEuro(used)}
                     </div>
+                    {srdCover > 0.001 && (
+                      <div className="text-[11px] text-rose-700 mt-0.5">
+                        − {fmtEuro(srdCover)} SRD-tekort gedekt
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -2686,6 +2726,11 @@
                     <div className="text-xs text-stone-500 mt-1">
                       Start {fmtSrd(start)} − uitbetaald {fmtSrd(used)}
                     </div>
+                    {srdCoveredEur[k] > 0.001 && (
+                      <div className="text-[11px] text-emerald-700 mt-1">
+                        waarvan ≈ {fmtEuro(srdCoveredEur[k])} uit Shenifa rekening (€) gedekt
+                      </div>
+                    )}
                   </div>
                 );
               })}
