@@ -2338,6 +2338,9 @@
             {calc.manualBonuses.map(b => (
               <PayslipRow key={b.id} label={`${b.description || 'Bonus'}${b.sales ? ` (${b.sales} sales)` : ''}`} value={fmtEuro(Number(b.amount) || 0)} />
             ))}
+            {calc.trainingHours > 0 && (
+              <PayslipRow label={`Trainingsuren onbetaald (${fmtHours(calc.trainingHours)} uur)`} value={`− ${fmtEuro(calc.trainingDeduction)}`} />
+            )}
           </div>
         </div>
       );
