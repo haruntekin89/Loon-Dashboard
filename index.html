@@ -1054,6 +1054,12 @@
           y += 3;
         }
 
+        if (c.trainingHours > 0) {
+          sectionHeader('Trainingsuren (onbetaald)');
+          row('Trainingsuren', fmtHours(c.trainingHours) + ' uur', fmtEuro(c.wage), '- ' + fmtEuro(c.trainingDeduction));
+          y += 3;
+        }
+
         ensureSpace(22);
         y += 4;
         doc.setFillColor(...ACCENT); doc.rect(MARGIN, y, PAGE_W - 2 * MARGIN, 16, 'F');
