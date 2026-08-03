@@ -1884,6 +1884,7 @@
                         <div className="text-xs text-stone-500">
                           {(md.manualBonuses?.length || 0) > 0 && <span className="mr-3">{md.manualBonuses.length} bonus(sen)</span>}
                           {(md.incentiveHours || 0) > 0 && <span className="mr-3">+{fmtHours(md.incentiveHours)} inc. uur</span>}
+                          {(md.trainingHours || 0) > 0 && <span className="mr-3 text-rose-600">−{fmtHours(md.trainingHours)} training</span>}
                         </div>
                       </button>
 
@@ -1928,6 +1929,14 @@
                               <div className="grid grid-cols-[1fr_90px] gap-2 items-center">
                                 <div className="text-sm text-stone-600">Aantal uren</div>
                                 <Input type="number" step="0.25" value={md.incentiveHours || ''} onChange={(e) => setIncentiveHours(a.id, parseFloat(e.target.value) || 0)} placeholder="0" />
+                              </div>
+                            </div>
+
+                            <div>
+                              <div className="text-xs text-stone-500 uppercase tracking-wider font-medium mb-2">Trainingsuren (onbetaald)</div>
+                              <div className="grid grid-cols-[1fr_90px] gap-2 items-center">
+                                <div className="text-sm text-stone-600">Aantal uren (wordt afgetrokken)</div>
+                                <Input type="number" step="0.25" value={md.trainingHours || ''} onChange={(e) => setTrainingHours(a.id, parseFloat(e.target.value) || 0)} placeholder="0" />
                               </div>
                             </div>
 
