@@ -724,12 +724,13 @@
 
       /* ---------- Agent month data ---------- */
       function getAgentMD(agentId) {
-        return agentMonthData[agentId] || { incentiveHours: 0, sales: {}, manualBonuses: [], systemOutages: [] };
+        return agentMonthData[agentId] || { incentiveHours: 0, trainingHours: 0, sales: {}, manualBonuses: [], systemOutages: [] };
       }
       function updateAgentMD(agentId, fn) {
         setAgentMonthData(d => ({ ...d, [agentId]: fn(getAgentMD(agentId)) }));
       }
       function setIncentiveHours(agentId, hours) { updateAgentMD(agentId, md => ({ ...md, incentiveHours: hours })); }
+      function setTrainingHours(agentId, hours) { updateAgentMD(agentId, md => ({ ...md, trainingHours: hours })); }
       function setSales(agentId, projectId, count) {
         updateAgentMD(agentId, md => {
           const newSales = { ...md.sales };
@@ -821,6 +822,10 @@
         const incHours = Number(md.incentiveHours) || 0;
         const incentivePay = incHours * wage;
 
+        // Trainingsuren zijn onbetaald: aftrek van het totaal, telt niet mee voor bonusdrempels
+        const trainingHours = Number(md.trainingHours) || 0;
+        const trainingDeduction = trainingHours * wage;
+
         // Combine sales: sum from time entries + manual override (md.sales overrides if set)
         const projectBonuses = projects.map(p => {
           // Match project-name-from-CSV to configured project (case insensitive)
@@ -863,13 +868,15 @@
         const totalFixedAllowances = fixedAllowances.reduce((s, a) => s + (Number(a.amount) || 0), 0);
 
         const totalGross = workPay + holidayPay + incentivePay + outagePay + toiletPay
-          + totalProjectBonus + totalManualBonus + hourBonusAmount + totalFixedAllowances;
+          + totalProjectBonus + totalManualBonus + hourBonusAmount + totalFixedAllowances
+          - trainingDeduction;
 
         return {
           workHours, workPay, wage,
           projectGroups,
           totalHolidayHours, holidayPay, paidHolidays,
           incentiveHours: incHours, incentivePay,
+          trainingHours, trainingDeduction,
           systemOutages, outageHours, outagePay,
           toiletHours, toiletPay,
           qualifyingHours, hourBonus: hourBonusAmount, hourBonusTier: hourBonusResult.tier,
@@ -1328,7 +1335,7 @@
                 holidays={holidays} addHoliday={addHoliday} updateHoliday={updateHoliday} removeHoliday={removeHoliday}
                 agents={agents} projects={projects}
                 getAgentMD={getAgentMD}
-                setIncentiveHours={setIncentiveHours} setSales={setSales}
+                setIncentiveHours={setIncentiveHours} setTrainingHours={setTrainingHours} setSales={setSales}
                 addManualBonus={addManualBonus} updateManualBonus={updateManualBonus} removeManualBonus={removeManualBonus}
                 addSystemOutage={addSystemOutage} updateSystemOutage={updateSystemOutage} removeSystemOutage={removeSystemOutage}
               />
@@ -1715,7 +1722,7 @@
       unmatchedCsvNames, addAgentFromCsv, linkCsvNameToAgent, removeUnmatchedCsvName, csvMatchSummary,
       holidays, addHoliday, updateHoliday, removeHoliday,
       agents, projects, getAgentMD,
-      setIncentiveHours, setSales, addManualBonus, updateManualBonus, removeManualBonus,
+      setIncentiveHours, setTrainingHours, setSales, addManualBonus, updateManualBonus, removeManualBonus,
       addSystemOutage, updateSystemOutage, removeSystemOutage }) {
 
       const [expandedAgent, setExpandedAgent] = useState(null);
