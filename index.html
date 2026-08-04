@@ -59,7 +59,9 @@
       async get(key) {
         if (!sb) return null;
         const { data, error } = await sb.from('payroll_data').select('value').eq('key', key).maybeSingle();
-        if (error) { console.error('storage.get', error); return null; }
+        // Een fout (netwerk, gepauzeerd project) mag NIET op "geen data" lijken:
+        // de app zou anders lege state opslaan over bestaande data heen.
+        if (error) { console.error('storage.get', error); throw error; }
         if (!data) return null;
         return { key, value: data.value, shared: true };
       },
@@ -346,6 +348,27 @@
       const [jsPdfLoaded, setJsPdfLoaded] = useState(false);
       const [generating, setGenerating] = useState(false);
 
+      // Opslag-bewaking: saves mogen pas lopen nadat de bijbehorende data
+      // aantoonbaar geladen is, anders overschrijft lege state de server.
+      const [setupLoaded, setSetupLoaded] = useState(false);
+      const [loadedMonth, setLoadedMonth] = useState(null); // maand die succesvol geladen is
+      const [loadError, setLoadError] = useState(null);     // string | null
+      const [unsaved, setUnsaved] = useState({ setup: false, month: false });
+      const retryTimers = React.useRef({});
+      const dirtyRef = React.useRef({ setup: false, month: false });
+      const pendingMonthSave = React.useRef(null); // { key, payload } die nog niet op de server staat
+
+      useEffect(() => {
+        const onBeforeUnload = (e) => {
+          if (dirtyRef.current.setup || dirtyRef.current.month) {
+            e.preventDefault();
+            e.returnValue = '';
+          }
+        };
+        window.addEventListener('beforeunload', onBeforeUnload);
+        return () => window.removeEventListener('beforeunload', onBeforeUnload);
+      }, []);
+
       /* Load fonts and jsPDF */
       useEffect(() => {
         if (!document.getElementById('payroll-fonts')) {
@@ -391,18 +414,47 @@
               if (Array.isArray(data.hourBonusTiers)) setHourBonusTiers(data.hourBonusTiers);
               if (typeof data.toiletAllowanceHours === 'number') setToiletAllowanceHours(data.toiletAllowanceHours);
             }
-          } catch (e) { /* first run */ }
+            // r === null betekent echt "nog geen data" (eerste keer); een
+            // fout gooit en houdt setupLoaded op false zodat er niets
+            // overheen wordt geschreven.
+            setSetupLoaded(true);
+          } catch (e) {
+            console.error('setup laden mislukt', e);
+            setLoadError('Instellingen konden niet geladen worden. Controleer je internetverbinding en herlaad de pagina — er wordt niets opgeslagen zolang dit niet lukt.');
+          }
           setLoading(false);
         })();
       }, []);
 
       /* Load month when currentMonth changes (with migration from old format) */
       useEffect(() => {
-        if (loading) return;
+        if (loading || !setupLoaded) return;
+        let cancelled = false;
+        const month = currentMonth;
+        // Blokkeer saves voor deze maand tot de load aantoonbaar gelukt is.
+        setLoadedMonth(null);
+        setLoadError(null);
         (async () => {
+          // Eerst een eventueel nog niet weggeschreven wijziging van de
+          // vorige maand opslaan (debounce van 400ms kan nog open staan).
+          const pending = pendingMonthSave.current;
+          if (pending && pending.key !== `month:${month}`) {
+            try {
+              await window.storage.set(pending.key, pending.payload);
+              pendingMonthSave.current = null;
+              dirtyRef.current.month = false;
+            } catch (e) {
+              if (cancelled) return;
+              console.error('openstaande wijziging opslaan mislukt', e);
+              setLoadError('De laatste wijziging van de vorige maand kon niet opgeslagen worden. Controleer je internetverbinding en herlaad de pagina.');
+              return;
+            }
+            if (cancelled) return;
+          }
           let savedPayout = null;
           try {
-            const r = await window.storage.get(`month:${currentMonth}`);
+            const r = await window.storage.get(`month:${month}`);
+            if (cancelled) return;
             if (r) {
               const parsed = JSON.parse(r.value);
               if (Array.isArray(parsed.timeEntries)) {
@@ -428,10 +480,16 @@
               setAgentMonthData(parsed.agentMonthData || {});
               savedPayout = parsed.payoutData || null;
             } else {
+              // Echt geen data voor deze maand (nieuwe maand) — leeg is correct.
               setTimeEntries([]); setHolidays([]); setAgentMonthData({});
             }
           } catch (e) {
-            setTimeEntries([]); setHolidays([]); setAgentMonthData({});
+            // Laden mislukt: NIET op leeg zetten en NIET gaan opslaan,
+            // anders wordt de servermaand overschreven met lege data.
+            if (cancelled) return;
+            console.error('maand laden mislukt', e);
+            setLoadError(`Maand ${month} kon niet geladen worden. Controleer je internetverbinding en herlaad de pagina — wijzigingen worden nu niet opgeslagen.`);
+            return;
           }
 
           // Payout data: load saved if present, else carry over remaining funds from previous month
@@ -443,8 +501,9 @@
             });
           } else {
             try {
-              const prev = prevMonth(currentMonth);
+              const prev = prevMonth(month);
               const prevR = await window.storage.get(`month:${prev}`);
+              if (cancelled) return;
               if (prevR) {
                 const prevParsed = JSON.parse(prevR.value);
                 const pp = prevParsed.payoutData;
@@ -484,33 +543,65 @@
                 setPayoutData({ funds: emptyFunds(), payouts: {}, saldoRate: 0 });
               }
             } catch (e) {
-              setPayoutData({ funds: emptyFunds(), payouts: {}, saldoRate: 0 });
+              // Vorige maand kon niet gelezen worden: niet gokken met lege
+              // potten (die zouden daarna opgeslagen worden), maar stoppen.
+              if (cancelled) return;
+              console.error('vorige maand laden mislukt', e);
+              setLoadError(`Maand ${month} kon niet volledig geladen worden (overdracht vorige maand). Herlaad de pagina — wijzigingen worden nu niet opgeslagen.`);
+              return;
             }
           }
+          if (cancelled) return;
+          setLoadedMonth(month);
         })();
-      }, [currentMonth, loading]);
+        return () => { cancelled = true; };
+      }, [currentMonth, loading, setupLoaded]);
 
-      /* Save setup (debounced) */
+      /* Save setup (debounced, alleen na geslaagde load, met retry) */
       useEffect(() => {
-        if (loading) return;
-        const t = setTimeout(async () => {
+        if (!setupLoaded) return;
+        const payload = JSON.stringify({ company, agents, projects, hourBonusTiers, toiletAllowanceHours });
+        dirtyRef.current.setup = true;
+        const attempt = async () => {
           try {
-            await window.storage.set('setup', JSON.stringify({ company, agents, projects, hourBonusTiers, toiletAllowanceHours }));
-          } catch (e) { console.error(e); }
-        }, 400);
-        return () => clearTimeout(t);
-      }, [company, agents, projects, hourBonusTiers, toiletAllowanceHours, loading]);
+            await window.storage.set('setup', payload);
+            dirtyRef.current.setup = false;
+            setUnsaved(u => (u.setup ? { ...u, setup: false } : u));
+          } catch (e) {
+            console.error('setup opslaan mislukt', e);
+            setUnsaved(u => (u.setup ? u : { ...u, setup: true }));
+            retryTimers.current.setup = setTimeout(attempt, 5000);
+          }
+        };
+        const t = setTimeout(attempt, 400);
+        return () => { clearTimeout(t); clearTimeout(retryTimers.current.setup); };
+      }, [company, agents, projects, hourBonusTiers, toiletAllowanceHours, setupLoaded]);
 
-      /* Save month (debounced) */
+      /* Save month (debounced, alleen als déze maand geladen is, met retry) */
       useEffect(() => {
-        if (loading) return;
-        const t = setTimeout(async () => {
+        if (loadedMonth !== currentMonth) return;
+        const key = `month:${currentMonth}`;
+        const payload = JSON.stringify({ timeEntries, holidays, agentMonthData, payoutData });
+        dirtyRef.current.month = true;
+        pendingMonthSave.current = { key, payload };
+        const attempt = async () => {
           try {
-            await window.storage.set(`month:${currentMonth}`, JSON.stringify({ timeEntries, holidays, agentMonthData, payoutData }));
-          } catch (e) { console.error(e); }
-        }, 400);
-        return () => clearTimeout(t);
-      }, [timeEntries, holidays, agentMonthData, payoutData, currentMonth, loading]);
+            await window.storage.set(key, payload);
+            const p = pendingMonthSave.current;
+            if (p && p.key === key && p.payload === payload) {
+              pendingMonthSave.current = null;
+              dirtyRef.current.month = false;
+            }
+            setUnsaved(u => (u.month ? { ...u, month: false } : u));
+          } catch (e) {
+            console.error('maand opslaan mislukt', e);
+            setUnsaved(u => (u.month ? u : { ...u, month: true }));
+            retryTimers.current.month = setTimeout(attempt, 5000);
+          }
+        };
+        const t = setTimeout(attempt, 400);
+        return () => { clearTimeout(t); clearTimeout(retryTimers.current.month); };
+      }, [timeEntries, holidays, agentMonthData, payoutData, currentMonth, loadedMonth]);
 
       function notify(msg, kind = 'success') {
         setNotification({ msg, kind });
@@ -1268,6 +1359,19 @@
       return (
         <div style={baseStyle} className="min-h-screen bg-stone-100">
           <style>{globalCss}</style>
+
+          {loadError && (
+            <div className="bg-rose-600 text-white text-sm font-medium px-6 py-3 flex items-center gap-2 sticky top-0 z-50">
+              <AlertTriangle size={16} className="shrink-0" />
+              {loadError}
+            </div>
+          )}
+          {!loadError && (unsaved.setup || unsaved.month) && (
+            <div className="bg-amber-500 text-white text-sm font-medium px-6 py-3 flex items-center gap-2 sticky top-0 z-50">
+              <AlertTriangle size={16} className="shrink-0" />
+              Opslaan mislukt — er wordt elke 5 seconden opnieuw geprobeerd. Sluit de pagina niet, anders gaan je laatste wijzigingen verloren.
+            </div>
+          )}
 
           {notification && (
             <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg text-sm font-medium flex items-center gap-2 ${
