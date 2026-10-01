@@ -877,15 +877,19 @@
         const groupMap = {};
         let totalSecs = 0;
         for (const e of entries) {
-          const projName = e.projectName?.trim() || 'Geen project';
-          if (!groupMap[projName]) {
-            groupMap[projName] = {
-              projectName: projName,
+          // Groepeer hoofdletterongevoelig ("raadselgids" en "Raadselgids" = één project),
+          // met de naam uit de projectinstellingen als weergavenaam
+          const rawName = e.projectName?.trim() || 'Geen project';
+          const groupKey = rawName.toLowerCase();
+          if (!groupMap[groupKey]) {
+            const configured = projects.find(p => (p.name || '').trim().toLowerCase() === groupKey);
+            groupMap[groupKey] = {
+              projectName: configured ? configured.name.trim() : rawName,
               begeleiding: 0, nawerktijd: 0, inGesprek: 0, uitbellend: 0, beschikbaar: 0, totalSecs: 0,
               sales: 0
             };
           }
-          const g = groupMap[projName];
+          const g = groupMap[groupKey];
           g.begeleiding += e.begeleiding || 0;
           g.nawerktijd += e.nawerktijd || 0;
           g.inGesprek += e.inGesprek || 0;
