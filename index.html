@@ -2357,8 +2357,8 @@
       const [search, setSearch] = useState('');
       const totals = useMemo(() => agents.map(a => ({ agent: a, calc: computeAgentPayroll(a) })), [agents, computeAgentPayroll]);
       const grandTotal = totals.reduce((s, t) => s + t.calc.totalGross, 0);
-      // Totaal verdiende bonus, exclusief incentive bonussen (manualBonuses)
-      const grandBonus = totals.reduce((s, t) => s + t.calc.totalProjectBonus + t.calc.hourBonus, 0);
+      // Alleen bonus uit de project-staffels; excl. uren-bonus en handmatige bonussen (incentive, aanwezigheid, inbreng)
+      const grandBonus = totals.reduce((s, t) => s + t.calc.totalProjectBonus, 0);
       const filteredTotals = useMemo(
         () => totals.filter(t => agentMatchesSearch(t.agent, search)),
         [totals, search]
@@ -2369,7 +2369,7 @@
           <div className="flex items-baseline justify-between flex-wrap gap-3">
             <div>
               <div style={displayFont} className="text-3xl text-stone-900">Loonstroken</div>
-              <div className="text-sm text-stone-500 mt-1">{fmtMonth(currentMonth)} · totaal {fmtEuro(grandTotal)} · bonus {fmtEuro(grandBonus)} <span className="text-stone-400">(excl. incentive bonussen)</span></div>
+              <div className="text-sm text-stone-500 mt-1">{fmtMonth(currentMonth)} · totaal {fmtEuro(grandTotal)} · staffelbonus {fmtEuro(grandBonus)} <span className="text-stone-400">(excl. uren-, aanwezigheids- en incentive bonussen)</span></div>
             </div>
             <div className="flex flex-wrap gap-2">
               <button onClick={generatePayoutSheet} disabled={agents.length === 0}
